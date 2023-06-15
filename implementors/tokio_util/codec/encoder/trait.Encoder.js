@@ -1,0 +1,4 @@
+(function() {var implementors = {
+"dit_core":[["impl <a class=\"trait\" href=\"tokio_util/codec/encoder/trait.Encoder.html\" title=\"trait tokio_util::codec::encoder::Encoder\">Encoder</a>&lt;<a class=\"struct\" href=\"dit_core/peer/proto/struct.Packet.html\" title=\"struct dit_core::peer::proto::Packet\">Packet</a>&gt; for <a class=\"struct\" href=\"dit_core/peer/proto/struct.Codec.html\" title=\"struct dit_core::peer::proto::Codec\">Codec</a>"]],
+"tokio_util":[]
+};if (window.register_implementors) {window.register_implementors(implementors);} else {window.pending_implementors = implementors;}})()

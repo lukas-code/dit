@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["Command"],"fn":["install_default_tracing_subscriber","run"],"struct":["Args"]};
