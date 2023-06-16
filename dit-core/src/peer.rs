@@ -25,7 +25,7 @@ pub struct Config {
     pub addr: DhtAndSocketAddr,
     pub ttl: u32,
     pub query_queue_size: usize,
-    pub max_packet_length: usize,
+    pub max_packet_length: u32,
 }
 
 #[derive(Debug)]

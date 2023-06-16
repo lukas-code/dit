@@ -3,6 +3,8 @@ use super::{DhtAddr, DhtAndSocketAddr, SocketAddr};
 
 use bytes::{Buf, BytesMut};
 use serde::{Deserialize, Serialize};
+use std::error::Error;
+use std::fmt;
 use std::sync::Arc;
 use tokio::io;
 use tokio_util::codec::{Decoder, Encoder};
@@ -90,14 +92,16 @@ impl Decoder for Codec {
 
         let mut length_bytes = [0; 4];
         length_bytes.copy_from_slice(&src[..4]);
-        let length = u32::from_be_bytes(length_bytes).try_into().unwrap();
+        let length = u32::from_be_bytes(length_bytes);
 
         if length > self.config.max_packet_length {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "packet too long",
+                PacketTooLong(()),
             ));
         }
+
+        let length = length.try_into().unwrap();
 
         if src.len() < length {
             src.reserve(length - src.len());
@@ -116,22 +120,41 @@ impl Encoder<Packet> for Codec {
     fn encode(&mut self, packet: Packet, dst: &mut BytesMut) -> Result<(), Self::Error> {
         let encoded_packet = serde_json::to_vec(&packet)?;
 
-        let length = encoded_packet.len() + 4;
-        if length > self.config.max_packet_length {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "packet too long",
-            ));
-        }
+        let length = match encoded_packet
+            .len()
+            .checked_add(4)
+            .and_then(|len| u32::try_from(len).ok())
+        {
+            Some(length) if length <= self.config.max_packet_length => length,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    PacketTooLong(()),
+                ))
+            }
+        };
 
-        let length_bytes = u32::try_from(length).unwrap().to_be_bytes();
-        dst.reserve(length);
+        let length_bytes = length.to_be_bytes();
+        dst.reserve(encoded_packet.len() + 4);
         dst.extend_from_slice(&length_bytes);
         dst.extend_from_slice(&encoded_packet);
 
         Ok(())
     }
 }
+
+/// Error returned by [`Codec::encode`] and [`codec::decode`] if a packet is longer than the
+/// configured maximum length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PacketTooLong(());
+
+impl fmt::Display for PacketTooLong {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("packet too long")
+    }
+}
+
+impl Error for PacketTooLong {}
 
 #[cfg(test)]
 mod tests {
@@ -174,9 +197,13 @@ mod tests {
         let mut framed = Framed::new(stream, codec);
 
         framed.send(test_packet.clone()).await.unwrap();
+        let bytes_sent = framed.get_ref().position();
+
         framed.get_mut().set_position(0);
         let received = framed.next().await.unwrap().unwrap();
+        let bytes_received = framed.get_ref().position();
 
         assert_eq!(received, test_packet);
+        assert_eq!(bytes_sent, bytes_received);
     }
 }
