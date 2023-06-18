@@ -1,0 +1,42 @@
+name: CI
+
+on: [pull_request]
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        rust:
+          - stable
+          - nightly
+        os:
+          - windows-latest
+          - ubuntu-latest
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install Rust Packages
+        run: |
+          rustup default ${{ matrix.rust }}
+          rustup component add rustfmt clippy
+        shell: bash
+
+      - name: Build
+        run: |
+          cargo build
+          cargo build --release
+
+      - name: Test
+        run: |
+          cargo test
+          cargo test --release
+
+      - name: Run Clippy
+        run: cargo clippy
+
+      - name: Check Formatting
+        run: cargo fmt -- --check
