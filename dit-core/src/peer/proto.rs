@@ -9,17 +9,25 @@ use std::sync::Arc;
 use tokio::io;
 use tokio_util::codec::{Decoder, Encoder};
 
-/// A datagram that can be routed though the peer-to-peer network.
+/// A datagram that can be sent to a peer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Packet {
-    pub src: DhtAndSocketAddr,
-    pub dst: DhtAddr,
-    pub ttl: u32,
-    pub payload: Payload,
+pub enum Packet {
+    /// The packet targets a [`DhtAddr`] and should be routed though the peer-to-peer network.
+    Dht(DhtPacket),
+    /// The packet targets a specific peer by its [`SocketAddr`] directly.
+    Socket(SocketPacket),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Payload {
+pub struct DhtPacket {
+    pub src: DhtAndSocketAddr,
+    pub dst: DhtAddr,
+    pub ttl: u32,
+    pub payload: DhtPayload,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DhtPayload {
     Ping(u64),
     Pong(u64),
     NeighborsRequest,
@@ -38,23 +46,23 @@ pub enum Payload {
     GetResponse(Vec<SocketAddr>),
 }
 
-impl Payload {
-    pub fn kind(&self) -> PayloadKind {
+impl DhtPayload {
+    pub fn kind(&self) -> DhtPayloadKind {
         match self {
-            Payload::Ping { .. } => PayloadKind::Ping,
-            Payload::Pong { .. } => PayloadKind::Pong,
-            Payload::NeighborsRequest { .. } => PayloadKind::NeighborsRequest,
-            Payload::NeighborsResponse { .. } => PayloadKind::NeighborsResponse,
-            Payload::PutRequest { .. } => PayloadKind::PutRequest,
-            Payload::PutResponse { .. } => PayloadKind::PutResponse,
-            Payload::GetRequest { .. } => PayloadKind::GetRequest,
-            Payload::GetResponse { .. } => PayloadKind::GetResponse,
+            DhtPayload::Ping { .. } => DhtPayloadKind::Ping,
+            DhtPayload::Pong { .. } => DhtPayloadKind::Pong,
+            DhtPayload::NeighborsRequest { .. } => DhtPayloadKind::NeighborsRequest,
+            DhtPayload::NeighborsResponse { .. } => DhtPayloadKind::NeighborsResponse,
+            DhtPayload::PutRequest { .. } => DhtPayloadKind::PutRequest,
+            DhtPayload::PutResponse { .. } => DhtPayloadKind::PutResponse,
+            DhtPayload::GetRequest { .. } => DhtPayloadKind::GetRequest,
+            DhtPayload::GetResponse { .. } => DhtPayloadKind::GetResponse,
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum PayloadKind {
+pub enum DhtPayloadKind {
     Ping,
     Pong,
     NeighborsRequest,
@@ -63,6 +71,17 @@ pub enum PayloadKind {
     PutResponse,
     GetRequest,
     GetResponse,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SocketPacket {
+    pub payload: SocketPayload,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SocketPayload {
+    Ping(u64),
+    Pong(u64),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -176,21 +195,21 @@ mod tests {
             max_packet_length: 1024,
         };
 
-        let test_packet = Packet {
+        let test_packet = Packet::Dht(DhtPacket {
             src: DhtAndSocketAddr {
                 dht_addr: DhtAddr::random(),
                 socket_addr: "[::1]:1".parse().unwrap(),
             },
             dst: DhtAddr::random(),
             ttl: 123,
-            payload: Payload::NeighborsResponse(Neighbors {
+            payload: DhtPayload::NeighborsResponse(Neighbors {
                 pred: Some(DhtAndSocketAddr {
                     dht_addr: DhtAddr::hash(b"pred"),
                     socket_addr: "[FEED::]:0".parse().unwrap(),
                 }),
                 succ: None,
             }),
-        };
+        });
 
         let stream = Cursor::new(Vec::new());
         let codec = Codec::new(Arc::new(config));

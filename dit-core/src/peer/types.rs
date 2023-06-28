@@ -1,9 +1,9 @@
-pub use std::net::SocketAddr;
-
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::fmt;
+pub use std::net::SocketAddr;
 use std::str::FromStr;
 
 /// This address uniquely identifies peers and data stored on the distributed hash table.
@@ -141,21 +141,94 @@ impl FromStr for DhtAddr {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ParseDhtAddrError(());
 
+/// A wrapping range of [`DhtAddr`]s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DhtAddrRange {
+    start: DhtAddr,
+    len: DhtAddr,
+}
+
+impl DhtAddrRange {
+    /// Creates a new range.
+    ///
+    /// The start is inclusive and the end exclusive.
+    pub fn new(start_inclusive: DhtAddr, end_exclusive: DhtAddr) -> Self {
+        let start = start_inclusive;
+        let len = end_exclusive.wrapping_sub(start_inclusive);
+        DhtAddrRange { start, len }
+    }
+
+    /// Returns whether the range contains the address.
+    pub fn contains(&self, addr: DhtAddr) -> bool {
+        addr.wrapping_sub(self.start) < self.len
+    }
+
+    /// Returns whether the range is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len.is_zero()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DhtAndSocketAddr {
     pub dht_addr: DhtAddr,
     pub socket_addr: SocketAddr,
 }
 
-#[derive(Debug)]
-pub struct Fingers {}
+impl DhtAndSocketAddr {
+    pub const fn new(dht_addr: DhtAddr, socket_addr: SocketAddr) -> Self {
+        Self {
+            dht_addr,
+            socket_addr,
+        }
+    }
+}
+
+/// The table of successors of a peer.
+///
+/// finger(index) = successor(self_addr + 2<sup>index</sup>)
+#[derive(Debug, Clone, Default)]
+pub struct Fingers {
+    map: BTreeMap<usize, DhtAndSocketAddr>,
+}
 
 impl Fingers {
-    #[track_caller]
-    pub fn insert(&mut self, index: usize, addrs: DhtAndSocketAddr) {
-        assert!(index < DhtAddr::BITS, "Fingers: index out of bounds");
-        // btmap.range
+    pub fn index_of(self_addr: DhtAddr, dst_addr: DhtAddr) -> usize {
+        dst_addr.wrapping_sub(self_addr).log2()
+    }
 
+    /// Returns an empty finger table.
+    pub const fn new() -> Self {
+        Self {
+            map: BTreeMap::new(),
+        }
+    }
+
+    /// Inserts a new finger at the index, returning the previous finger.
+    #[track_caller]
+    pub fn insert(&mut self, index: usize, addrs: DhtAndSocketAddr) -> Option<DhtAndSocketAddr> {
+        assert!(index < DhtAddr::BITS, "Fingers: index out of bounds");
+        self.map.insert(index, addrs)
+    }
+
+    /// Removes the finger at the index, returning it.
+    #[track_caller]
+    pub fn remove(&mut self, index: usize) -> Option<DhtAndSocketAddr> {
+        assert!(index < DhtAddr::BITS, "Fingers: index out of bounds");
+        self.map.remove(&index)
+    }
+
+    /// Returns a finger at the index or below.
+    #[track_caller]
+    pub fn get(&mut self, index: usize) -> Option<&DhtAndSocketAddr> {
+        assert!(index < DhtAddr::BITS, "Fingers: index out of bounds");
+        // if a key in `0..index` exists, return the value at the greatest of those keys,
+        // otherwise return the value for the smallest key
+        self.map
+            .range(..=index)
+            .next_back()
+            .or_else(|| self.map.first_key_value())
+            .map(|(_, addrs)| addrs)
     }
 }
 
@@ -258,5 +331,55 @@ mod tests {
     #[should_panic = "argument was zero"]
     fn log2_panic() {
         let _ = DhtAddr::zero().log2();
+    }
+
+    #[test]
+    fn fingers_insert_get() {
+        let mut fingers = Fingers::new();
+
+        let addrs1 = DhtAndSocketAddr {
+            dht_addr: "0000000000000000000000000000000000000000000000000000000000000001"
+                .parse()
+                .unwrap(),
+            socket_addr: "0.0.0.0:1".parse().unwrap(),
+        };
+        fingers.insert(1, addrs1);
+
+        let addrs2 = DhtAndSocketAddr {
+            dht_addr: "0000000000000000000000000000000000000000000000000000000000000002"
+                .parse()
+                .unwrap(),
+            socket_addr: "0.0.0.0:2".parse().unwrap(),
+        };
+        fingers.insert(3, addrs2);
+
+        assert_eq!(fingers.get(0), Some(&addrs1));
+        assert_eq!(fingers.get(1), Some(&addrs1));
+        assert_eq!(fingers.get(2), Some(&addrs1));
+        assert_eq!(fingers.get(3), Some(&addrs2));
+        assert_eq!(fingers.get(4), Some(&addrs2));
+    }
+
+    #[test]
+    fn range() {
+        let a = "4000000000000000000000000000000000000000000000000000000000000000"
+            .parse()
+            .unwrap();
+        let b = "C000000000000000000000000000000000000000000000000000000000000000"
+            .parse()
+            .unwrap();
+        let mid = "8000000000000000000000000000000000000000000000000000000000000000"
+            .parse()
+            .unwrap();
+
+        assert!(DhtAddrRange::new(a, b).contains(a));
+        assert!(!DhtAddrRange::new(a, b).contains(b));
+        assert!(DhtAddrRange::new(a, b).contains(mid));
+        assert!(!DhtAddrRange::new(a, b).contains(DhtAddr::zero()));
+
+        assert!(DhtAddrRange::new(b, a).contains(b));
+        assert!(!DhtAddrRange::new(b, a).contains(a));
+        assert!(!DhtAddrRange::new(b, a).contains(mid));
+        assert!(DhtAddrRange::new(b, a).contains(DhtAddr::zero()));
     }
 }

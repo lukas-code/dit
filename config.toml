@@ -1,0 +1,6 @@
+[peer]
+socket_addr = "127.0.0.1:1111"
+# ttl = 8
+
+[deamon]
+# control_socket = "127.0.0.1:1112"

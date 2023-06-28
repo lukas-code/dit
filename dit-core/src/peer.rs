@@ -5,9 +5,10 @@
 mod proto;
 pub mod types;
 
-use proto::{Neighbors, Packet};
-use tokio_util::codec::Framed;
-pub use types::{DhtAddr, DhtAndSocketAddr, SocketAddr};
+use crate::peer::proto::SocketPacket;
+
+use self::proto::{Codec, DhtPacket, DhtPayload, DhtPayloadKind, Neighbors, Packet, SocketPayload};
+pub use self::types::{DhtAddr, DhtAddrRange, DhtAndSocketAddr, Fingers, SocketAddr};
 
 use futures_util::{SinkExt, StreamExt};
 use std::collections::hash_map::{Entry, HashMap};
@@ -17,8 +18,7 @@ use std::sync::Arc;
 use tokio::io;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, watch};
-
-use self::proto::{Codec, Payload, PayloadKind};
+use tokio_util::codec::Framed;
 
 #[derive(Debug)]
 pub struct Config {
@@ -67,7 +67,7 @@ impl Runtime {
             next_subscription_id: SubscriptionId(0),
             subscriptions_by_id: HashMap::default(),
             subscriptions_by_kind: HashMap::default(),
-            neighbors: Neighbors::default(),
+            links: Links::default(),
         };
 
         Ok(Self {
@@ -85,6 +85,12 @@ struct ConnectionId(u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct SubscriptionId(u64);
 
+#[derive(Debug, Clone, Default)]
+struct Links {
+    predecessor: Option<DhtAndSocketAddr>,
+    successors: Fingers,
+}
+
 #[derive(Debug)]
 pub struct LocalPeer {
     config: Arc<Config>,
@@ -94,9 +100,10 @@ pub struct LocalPeer {
     next_connection_id: ConnectionId,
     inbound_connections: HashMap<ConnectionId, SocketAddr>,
     next_subscription_id: SubscriptionId,
-    subscriptions_by_id: HashMap<SubscriptionId, (oneshot::Sender<Packet>, DhtAddr, PayloadKind)>,
-    subscriptions_by_kind: HashMap<(DhtAddr, PayloadKind), Vec<SubscriptionId>>,
-    neighbors: Neighbors,
+    subscriptions_by_id:
+        HashMap<SubscriptionId, (oneshot::Sender<DhtPacket>, DhtAddr, DhtPayloadKind)>,
+    subscriptions_by_kind: HashMap<(DhtAddr, DhtPayloadKind), Vec<SubscriptionId>>,
+    links: Links,
 }
 
 impl LocalPeer {
@@ -129,15 +136,19 @@ impl LocalPeer {
                 }
                 Some(query) = self.query_receiver.recv() => {
                     tracing::trace!(?query, "processing query");
+                    #[allow(clippy::unit_arg)]
                     match query {
                         Query::RemoteConnect(response, socket_addr) => {
                             let _ = response.send(self.process_remote_connect(socket_addr));
                         }
-                        Query::GetNeighbors(response) => {
-                            let _ = response.send(self.process_get_neighbors());
+                        Query::GetLinks(response) => {
+                            let _ = response.send(self.process_get_links());
                         }
-                        Query::UpdateNeighbors(response, addrs) => {
-                            let _ = response.send(self.process_update_neighbors(addrs));
+                        Query::AddLink(response, addrs) => {
+                            let _ = response.send(self.process_add_link(addrs));
+                        }
+                        Query::RemoveLink(response, dht_addr) => {
+                            let _ = response.send(self.process_remove_link(dht_addr));
                         }
                         Query::NotifySubscribers(response, packet) => {
                             let _ = response.send(self.process_notify_subscribers(packet));
@@ -162,28 +173,34 @@ impl LocalPeer {
         id
     }
 
-    fn process_get_neighbors(&mut self) -> Neighbors {
-        self.neighbors
+    fn process_get_links(&mut self) -> Links {
+        self.links.clone()
     }
 
-    fn process_update_neighbors(&mut self, new: DhtAndSocketAddr) {
+    fn process_add_link(&mut self, new: DhtAndSocketAddr) {
         let keep_old = |old: DhtAndSocketAddr| {
             self.config.addr.dht_addr.wrapping_distance(old.dht_addr)
                 <= self.config.addr.dht_addr.wrapping_distance(new.dht_addr)
         };
 
-        if !self.neighbors.pred.is_some_and(keep_old) {
-            tracing::debug!(old = ?self.neighbors.pred, ?new, "updating pred");
-            self.neighbors.pred = Some(new)
+        if !self.links.predecessor.is_some_and(keep_old) {
+            tracing::debug!(old = ?self.links.predecessor, ?new, "updating predecessor");
+            self.links.predecessor = Some(new)
         }
 
-        if !self.neighbors.succ.is_some_and(keep_old) {
-            tracing::debug!(old = ?self.neighbors.succ, ?new, "updating succ");
-            self.neighbors.succ = Some(new)
+        let finger_index = Fingers::index_of(self.config.addr.dht_addr, new.dht_addr);
+        let old = self.links.successors.insert(finger_index, new);
+        if old != Some(new) {
+            tracing::debug!(?old, ?new, ?finger_index, "updating successor");
         }
     }
 
-    fn process_notify_subscribers(&mut self, packet: Packet) {
+    fn process_remove_link(&mut self, dht_addr: DhtAddr) {
+        // TODO: remove pred, remove fingers
+        todo!()
+    }
+
+    fn process_notify_subscribers(&mut self, packet: DhtPacket) {
         let kind = (packet.dst, packet.payload.kind());
         if let Some(ids) = self.subscriptions_by_kind.remove(&kind) {
             debug_assert!(!ids.is_empty());
@@ -203,8 +220,8 @@ impl LocalPeer {
     fn process_subscribe(
         &mut self,
         dht_addr: DhtAddr,
-        payload_kind: PayloadKind,
-    ) -> (SubscriptionId, oneshot::Receiver<Packet>) {
+        payload_kind: DhtPayloadKind,
+    ) -> (SubscriptionId, oneshot::Receiver<DhtPacket>) {
         let id = self.next_subscription_id;
         self.next_subscription_id =
             SubscriptionId(id.0.checked_add(1).expect("subscription id overflow"));
@@ -292,25 +309,30 @@ impl Controller {
 
         let self_addr = self.config.addr.dht_addr;
         let subscription = self
-            .query_subscribe(self_addr, PayloadKind::NeighborsResponse)
+            .query_subscribe(self_addr, DhtPayloadKind::NeighborsResponse)
             .await?;
 
-        self.send_packet(&mut framed, self_addr, self_addr, Payload::NeighborsRequest)
-            .await?;
+        self.send_dht_packet(
+            &mut framed,
+            self_addr,
+            self_addr,
+            DhtPayload::NeighborsRequest,
+        )
+        .await?;
 
         let response_packet = subscription.recv().await?; // <- TODO: timeout
-        let Payload::NeighborsResponse(neighbors) = response_packet.payload else {
+        let DhtPayload::NeighborsResponse(neighbors) = response_packet.payload else {
             unreachable!()
         };
 
-        self.query_update_neighbors(response_packet.src).await?;
+        self.query_add_link(response_packet.src).await?;
 
         if let Some(pred) = neighbors.pred {
-            self.query_update_neighbors(pred).await?;
+            self.query_add_link(pred).await?;
         }
 
         if let Some(succ) = neighbors.succ {
-            self.query_update_neighbors(succ).await?;
+            self.query_add_link(succ).await?;
         }
 
         Ok(())
@@ -326,22 +348,26 @@ impl Controller {
             .await
     }
 
-    async fn query_get_neighbors(&self) -> Response<Neighbors> {
-        self.send_query(|response| Query::GetNeighbors(response))
+    async fn query_get_links(&self) -> Response<Links> {
+        self.send_query(|response| Query::GetLinks(response)).await
+    }
+
+    async fn query_add_link(&self, addrs: DhtAndSocketAddr) -> Response<()> {
+        self.send_query(|response| Query::AddLink(response, addrs))
             .await
     }
 
-    async fn query_update_neighbors(&self, addrs: DhtAndSocketAddr) -> Response<()> {
-        self.send_query(|response| Query::UpdateNeighbors(response, addrs))
+    async fn query_remove_link(&self, dht_addr: DhtAddr) -> Response<()> {
+        self.send_query(|response| Query::RemoveLink(response, dht_addr))
             .await
     }
 
-    async fn query_notify_subscribers(&self, packet: Packet) -> Response<()> {
+    async fn query_notify_subscribers(&self, packet: DhtPacket) -> Response<()> {
         self.send_query(|response| Query::NotifySubscribers(response, packet))
             .await
     }
 
-    async fn query_subscribe(&self, addr: DhtAddr, kind: PayloadKind) -> Response<Subscription> {
+    async fn query_subscribe(&self, addr: DhtAddr, kind: DhtPayloadKind) -> Response<Subscription> {
         let (id, receiver) = self
             .send_query(|response| Query::Subscribe(response, addr, kind))
             .await?;
@@ -376,14 +402,14 @@ impl Controller {
         Ok(Framed::new(stream, codec))
     }
 
-    async fn send_packet(
+    async fn send_dht_packet(
         &self,
         framed: &mut Framed<TcpStream, Codec>,
         src: DhtAddr,
         dst: DhtAddr,
-        payload: Payload,
+        payload: DhtPayload,
     ) -> io::Result<()> {
-        let packet = Packet {
+        let packet = Packet::Dht(DhtPacket {
             src: DhtAndSocketAddr {
                 dht_addr: src,
                 socket_addr: self.config.addr.socket_addr,
@@ -391,9 +417,33 @@ impl Controller {
             dst,
             ttl: self.config.ttl,
             payload,
-        };
+        });
         tracing::trace!(?packet, socket_addr = ?framed.get_ref().peer_addr(), "sending packet");
         framed.send(packet).await
+    }
+
+    async fn send_socket_packet(
+        &self,
+        framed: &mut Framed<TcpStream, Codec>,
+        payload: SocketPayload,
+    ) -> io::Result<()> {
+        let packet = Packet::Socket(SocketPacket { payload });
+        tracing::trace!(?packet, socket_addr = ?framed.get_ref().peer_addr(), "sending packet");
+        framed.send(packet).await
+    }
+
+    async fn recv_socket_packet(
+        &self,
+        framed: &mut Framed<TcpStream, Codec>,
+    ) -> io::Result<SocketPacket> {
+        let Some(result) = framed.next().await else {
+            return Err(io::ErrorKind::UnexpectedEof.into())
+        };
+        let Packet::Socket(packet) = result? else {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "expected socket packet, got dht packet"));
+        };
+        tracing::trace!(?packet, socket_addr = ?framed.get_ref().peer_addr(), "received packet");
+        Ok(packet)
     }
 }
 
@@ -501,27 +551,55 @@ impl RemotePeerGuard {
         packet: Packet,
     ) -> io::Result<()> {
         tracing::debug!(?packet, "received packet");
-        let neighbors = self.controller.query_get_neighbors().await?;
+        match packet {
+            Packet::Dht(inner) => self.process_dht_packet(inner).await,
+            Packet::Socket(inner) => self.process_socket_packet(src_framed, inner).await,
+        }
+    }
+
+    async fn process_dht_packet(&mut self, packet: DhtPacket) -> io::Result<()> {
         self.controller
             .query_notify_subscribers(packet.clone())
             .await?;
-        self.controller.query_update_neighbors(packet.src).await?;
 
-        // TODO: do something with packet, forward it if needed
-        // (the following is a placeholder to get the basics working)
-        if packet.payload.kind() == PayloadKind::NeighborsRequest {
-            let mut dst_framed = self.controller.connect(packet.src.socket_addr).await?;
+        let links = self.controller.query_get_links().await?;
 
-            self.controller
-                .send_packet(
-                    &mut dst_framed,
-                    packet.src.dht_addr,
-                    packet.src.dht_addr,
-                    Payload::NeighborsResponse(neighbors),
-                )
-                .await?;
+        // TODO:
+        // * check links to see if this query is necessary
+        // * ping peer to make sure it's actually reachable
+        self.controller.query_add_link(packet.src).await?;
+
+        // // TODO: do something with packet, forward it if needed, delete link if stale
+        // // (the following is a placeholder to get the basics working)
+        // if packet.payload.kind() == DhtPayloadKind::NeighborsRequest {
+        //     let mut dst_framed = self.controller.connect(packet.src.socket_addr).await?;
+
+        //     self.controller
+        //         .send_packet(
+        //             &mut dst_framed,
+        //             packet.src.dht_addr,
+        //             packet.src.dht_addr,
+        //             DhtPayload::NeighborsResponse(neighbors),
+        //         )
+        //         .await?;
+        // }
+
+        Ok(())
+    }
+
+    async fn process_socket_packet(
+        &mut self,
+        src_framed: &mut Framed<TcpStream, Codec>,
+        packet: SocketPacket,
+    ) -> io::Result<()> {
+        match packet.payload {
+            SocketPayload::Ping(n) => {
+                self.controller
+                    .send_socket_packet(src_framed, SocketPayload::Pong(n))
+                    .await?;
+            }
+            SocketPayload::Pong(_) => {}
         }
-
         Ok(())
     }
 }
@@ -529,13 +607,14 @@ impl RemotePeerGuard {
 #[derive(Debug)]
 enum Query {
     RemoteConnect(oneshot::Sender<ConnectionId>, SocketAddr),
-    GetNeighbors(oneshot::Sender<Neighbors>),
-    UpdateNeighbors(oneshot::Sender<()>, DhtAndSocketAddr),
-    NotifySubscribers(oneshot::Sender<()>, Packet),
+    GetLinks(oneshot::Sender<Links>),
+    AddLink(oneshot::Sender<()>, DhtAndSocketAddr),
+    RemoveLink(oneshot::Sender<()>, DhtAddr),
+    NotifySubscribers(oneshot::Sender<()>, DhtPacket),
     Subscribe(
-        oneshot::Sender<(SubscriptionId, oneshot::Receiver<Packet>)>,
+        oneshot::Sender<(SubscriptionId, oneshot::Receiver<DhtPacket>)>,
         DhtAddr,
-        PayloadKind,
+        DhtPayloadKind,
     ),
 }
 
@@ -549,7 +628,7 @@ enum Event {
 #[derive(Debug)]
 struct Subscription {
     _guard: SubscriptionGuard,
-    receiver: oneshot::Receiver<Packet>,
+    receiver: oneshot::Receiver<DhtPacket>,
 }
 
 #[derive(Debug)]
@@ -568,7 +647,7 @@ impl Subscription {
     fn new(
         controller: Controller,
         id: SubscriptionId,
-        receiver: oneshot::Receiver<Packet>,
+        receiver: oneshot::Receiver<DhtPacket>,
     ) -> Self {
         Self {
             _guard: SubscriptionGuard { controller, id },
@@ -576,7 +655,7 @@ impl Subscription {
         }
     }
 
-    async fn recv(self) -> Response<Packet> {
+    async fn recv(self) -> Response<DhtPacket> {
         self.receiver.await.map_err(|_| ConnectionClosed(()))
     }
 }
