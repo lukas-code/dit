@@ -349,6 +349,7 @@ impl Controller {
     }
 
     async fn query_get_links(&self) -> Response<Links> {
+        #[allow(clippy::redundant_closure)]
         self.send_query(|response| Query::GetLinks(response)).await
     }
 
@@ -400,6 +401,15 @@ impl Controller {
         tracing::debug!(?socket_addr, "outbound connection established");
         let codec = Codec::new(self.config.clone());
         Ok(Framed::new(stream, codec))
+    }
+
+    async fn disconnect(
+        &self,
+        mut framed: Framed<TcpStream, Codec>,
+    ) -> io::Result<()> {
+        framed.close().await?;
+        framed.next().await.transpose()?;
+        Ok(())
     }
 
     async fn send_dht_packet(
