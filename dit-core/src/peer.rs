@@ -129,6 +129,7 @@ impl LocalPeer {
                 }
                 Some(query) = self.query_receiver.recv() => {
                     tracing::trace!(?query, "processing query");
+                    #[allow(clippy::unit_arg)]
                     match query {
                         Query::RemoteConnect(response, socket_addr) => {
                             let _ = response.send(self.process_remote_connect(socket_addr));
@@ -315,7 +316,7 @@ impl Controller {
     }
 
     /// Stores the [`LocalPeer`]'s [`SocketAddr`] in the DHT at [`DhtAddr`].
-    pub async fn announce(&self, dht_addr: DhtAddr) -> io::Result<()> {
+    pub async fn announce(&self, _dht_addr: DhtAddr) -> io::Result<()> {
         todo!()
     }
 
@@ -325,6 +326,7 @@ impl Controller {
     }
 
     async fn query_get_neighbors(&self) -> Response<Neighbors> {
+        #[allow(clippy::redundant_closure)]
         self.send_query(|response| Query::GetNeighbors(response))
             .await
     }
@@ -495,7 +497,7 @@ impl RemotePeer {
 impl RemotePeerGuard {
     async fn process_packet(
         &mut self,
-        src_framed: &mut Framed<TcpStream, Codec>,
+        _src_framed: &mut Framed<TcpStream, Codec>,
         packet: Packet,
     ) -> io::Result<()> {
         tracing::debug!(?packet, "received packet");
