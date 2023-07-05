@@ -52,7 +52,7 @@ pub async fn run(args: Args) {
                 async move {
                     loop {
                         let Some(remote) = rt1.listener.accept().await? else {
-                            return Ok::<(), io::Error>(())
+                            return Ok::<(), io::Error>(());
                         };
 
                         tokio::spawn(remote.run().in_current_span());
@@ -65,7 +65,7 @@ pub async fn run(args: Args) {
                 async move {
                     loop {
                         let Some(remote) = rt2.listener.accept().await? else {
-                            return Ok::<(), io::Error>(())
+                            return Ok::<(), io::Error>(());
                         };
 
                         tokio::spawn(remote.run().in_current_span());

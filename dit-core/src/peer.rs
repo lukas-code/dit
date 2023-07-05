@@ -229,14 +229,12 @@ impl LocalPeer {
     }
 
     fn process_unsubscribe(&mut self, id: SubscriptionId) {
-        let Some((_, dht_addr, payload_kind)) = self
-            .subscriptions_by_id
-            .remove(&id)
-        else {
+        let Some((_, dht_addr, payload_kind)) = self.subscriptions_by_id.remove(&id) else {
             return;
         };
 
-        let Entry::Occupied(mut entry) = self.subscriptions_by_kind.entry((dht_addr, payload_kind)) else {
+        let Entry::Occupied(mut entry) = self.subscriptions_by_kind.entry((dht_addr, payload_kind))
+        else {
             panic!("missing subscription entry for unsubscribe");
         };
 
