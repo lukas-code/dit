@@ -362,6 +362,7 @@ impl Controller {
             .await
     }
 
+    #[allow(dead_code)] // TODO: use this
     async fn query_remove_link(&self, dht_addr: DhtAddr) -> Response<()> {
         assert_ne!(dht_addr, self.config.addrs.dht_addr);
 
