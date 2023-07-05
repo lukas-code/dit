@@ -23,20 +23,28 @@ jobs:
         run: |
           rustup default ${{ matrix.rust }}
           rustup component add rustfmt clippy
-        shell: bash
 
-      - name: Build
-        run: |
-          cargo build
-          cargo build --release
+      - name: Enable problem matchers
+        run: echo ::add-matcher::.github/problem_matchers.json
+        if: ${{ matrix.rust == 'nightly' && matrix.os == 'ubuntu-latest' }}
 
-      - name: Test
-        run: |
-          cargo test
-          cargo test --release
+      - name: Build (debug)
+        run: cargo build
+
+      - name: Build (release)
+        run: cargo build --release
+
+      - name: Test (debug)
+        run: cargo test
+
+      - name: Test (release)
+        run: cargo test --release
 
       - name: Run Clippy
-        run: cargo clippy
+        run: cargo clippy --all-targets
+
+      - name: Generate Docs
+        run: cargo doc --no-deps --document-private-items
 
       - name: Check Formatting
-        run: cargo fmt -- --check
+        run: cargo fmt --check --all

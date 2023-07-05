@@ -143,7 +143,7 @@ impl Encoder<Packet> for Codec {
     }
 }
 
-/// Error returned by [`Codec::encode`] and [`codec::decode`] if a packet is longer than the
+/// Error returned by [`Codec::encode`] and [`Codec::decode`] if a packet is longer than the
 /// configured maximum length.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PacketTooLong(());

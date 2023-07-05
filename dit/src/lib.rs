@@ -1,5 +1,6 @@
 #![deny(rust_2018_idioms)]
 #![warn(missing_debug_implementations)]
+#![deny(rustdoc::broken_intra_doc_links)]
 
 use clap::{Parser, Subcommand};
 use dit_core::peer::{Config, DhtAddr, DhtAndSocketAddr, Runtime};
@@ -52,7 +53,7 @@ pub async fn run(args: Args) {
                 async move {
                     loop {
                         let Some(remote) = rt1.listener.accept().await? else {
-                            return Ok::<(), io::Error>(())
+                            return Ok::<(), io::Error>(());
                         };
 
                         tokio::spawn(remote.run().in_current_span());
@@ -65,7 +66,7 @@ pub async fn run(args: Args) {
                 async move {
                     loop {
                         let Some(remote) = rt2.listener.accept().await? else {
-                            return Ok::<(), io::Error>(())
+                            return Ok::<(), io::Error>(());
                         };
 
                         tokio::spawn(remote.run().in_current_span());
