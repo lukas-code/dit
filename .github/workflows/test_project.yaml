@@ -24,6 +24,10 @@ jobs:
           rustup default ${{ matrix.rust }}
           rustup component add rustfmt clippy
 
+      - name: Enable problem matchers
+        run: echo ::add-matcher::.github/problem_matchers.json
+        if: ${{ matrix.rust == 'nightly' && matrix.os == 'ubuntu-latest' }}
+
       - name: Build (debug)
         run: cargo build
 
