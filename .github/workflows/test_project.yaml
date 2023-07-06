@@ -29,22 +29,22 @@ jobs:
         if: ${{ matrix.rust == 'nightly' && matrix.os == 'ubuntu-latest' }}
 
       - name: Build (debug)
-        run: cargo build
+        run: cargo build --locked
 
       - name: Build (release)
-        run: cargo build --release
+        run: cargo build --locked --release
 
       - name: Test (debug)
-        run: cargo test
+        run: cargo test --locked
 
       - name: Test (release)
-        run: cargo test --release
+        run: cargo test --locked --release
 
       - name: Run Clippy
-        run: cargo clippy --all-targets
+        run: cargo clippy --locked --all-targets
 
       - name: Generate Docs
-        run: cargo doc --no-deps --document-private-items
+        run: cargo doc --locked --no-deps --document-private-items
 
       - name: Check Formatting
         run: cargo fmt --check --all
