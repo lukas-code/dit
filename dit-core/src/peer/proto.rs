@@ -69,6 +69,7 @@ pub struct Neighbors {
     pub succ: Option<DhtAndSocketAddr>,
 }
 
+#[derive(Debug, Clone, Copy)]
 pub struct Codec {
     max_packet_length: u32,
 }
@@ -106,7 +107,7 @@ impl Decoder for Codec {
             return Ok(None);
         }
 
-        let packet = serde_json::from_slice(&src[4..])?;
+        let packet = serde_json::from_slice(&src[4..length])?;
         src.advance(length);
         Ok(Some(packet))
     }
@@ -159,41 +160,65 @@ mod tests {
     use super::*;
 
     use futures_util::{SinkExt, StreamExt};
-    use std::io::Cursor;
     use tokio_util::codec::Framed;
 
     #[tokio::test]
     async fn encode_decode_roundtrip() {
         let max_packet_length = 1024;
 
-        let test_packet = Packet {
-            src: DhtAndSocketAddr {
-                dht_addr: DhtAddr::random(),
-                socket_addr: "[::1]:1".parse().unwrap(),
+        let test_packets = [
+            Packet {
+                src: DhtAndSocketAddr {
+                    dht_addr: DhtAddr::random(),
+                    socket_addr: "1.2.3.4:5".parse().unwrap(),
+                },
+                dst: DhtAddr::random(),
+                ttl: 123,
+                payload: Payload::NeighborsRequest,
             },
-            dst: DhtAddr::random(),
-            ttl: 123,
-            payload: Payload::NeighborsResponse(Neighbors {
-                pred: Some(DhtAndSocketAddr {
-                    dht_addr: DhtAddr::hash(b"pred"),
-                    socket_addr: "[FEED::]:0".parse().unwrap(),
+            Packet {
+                src: DhtAndSocketAddr {
+                    dht_addr: DhtAddr::random(),
+                    socket_addr: "[::1]:1".parse().unwrap(),
+                },
+                dst: DhtAddr::random(),
+                ttl: 456,
+                payload: Payload::NeighborsResponse(Neighbors {
+                    pred: Some(DhtAndSocketAddr {
+                        dht_addr: DhtAddr::hash(b"pred"),
+                        socket_addr: "[FEED::]:0".parse().unwrap(),
+                    }),
+                    succ: None,
                 }),
-                succ: None,
-            }),
-        };
+            },
+        ];
 
-        let stream = Cursor::new(Vec::new());
-        let codec = Codec::new(max_packet_length);
-        let mut framed = Framed::new(stream, codec);
+        for buffer_size in [1, 16, 1024] {
+            let (sender, receiver) = io::duplex(buffer_size);
+            let codec = Codec::new(max_packet_length);
+            let mut framed_sender = Framed::new(sender, codec);
+            let mut framed_receiver = Framed::new(receiver, codec);
 
-        framed.send(test_packet.clone()).await.unwrap();
-        let bytes_sent = framed.get_ref().position();
+            let send_packets = test_packets.clone();
+            let sender_task = tokio::spawn(async move {
+                for packet in send_packets {
+                    framed_sender.send(packet).await.unwrap();
+                }
+                framed_sender.close().await.unwrap();
+            });
 
-        framed.get_mut().set_position(0);
-        let received = framed.next().await.unwrap().unwrap();
-        let bytes_received = framed.get_ref().position();
+            let receiver_task = tokio::spawn(async move {
+                let mut received_packets = Vec::new();
+                while let Some(packet) = framed_receiver.next().await.transpose().unwrap() {
+                    received_packets.push(packet);
+                }
+                received_packets
+            });
 
-        assert_eq!(received, test_packet);
-        assert_eq!(bytes_sent, bytes_received);
+            sender_task.await.unwrap();
+            let received_packets = receiver_task.await.unwrap();
+
+            assert_eq!(received_packets, test_packets);
+        }
     }
 }
