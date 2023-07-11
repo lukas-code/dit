@@ -406,7 +406,7 @@ impl Controller {
     async fn connect(&self, socket_addr: SocketAddr) -> io::Result<Framed<TcpStream, Codec>> {
         let stream = TcpStream::connect(socket_addr).await?;
         tracing::debug!(?socket_addr, "outbound connection established");
-        let codec = Codec::new(self.config.clone());
+        let codec = Codec::new(self.config.max_packet_length);
         Ok(Framed::new(stream, codec))
     }
 
@@ -525,7 +525,7 @@ impl RemotePeer {
     #[tracing::instrument(name = "run_remote", skip(self), fields(self.id))]
     pub async fn run(mut self) -> io::Result<()> {
         tracing::debug!("starting remote peer");
-        let codec = Codec::new(self.guard.controller.config.clone());
+        let codec = Codec::new(self.guard.controller.config.max_packet_length);
         let mut framed = Framed::new(self.stream, codec);
         loop {
             tokio::select! {

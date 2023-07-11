@@ -1,11 +1,9 @@
-use super::Config;
 use super::{DhtAddr, DhtAndSocketAddr, SocketAddr};
 
 use bytes::{Buf, BytesMut};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fmt;
-use std::sync::Arc;
 use tokio::io;
 use tokio_util::codec::{Decoder, Encoder};
 
@@ -72,12 +70,12 @@ pub struct Neighbors {
 }
 
 pub struct Codec {
-    config: Arc<Config>,
+    max_packet_length: u32,
 }
 
 impl Codec {
-    pub fn new(config: Arc<Config>) -> Self {
-        Self { config }
+    pub fn new(max_packet_length: u32) -> Self {
+        Self { max_packet_length }
     }
 }
 
@@ -94,7 +92,7 @@ impl Decoder for Codec {
         length_bytes.copy_from_slice(&src[..4]);
         let length = u32::from_be_bytes(length_bytes);
 
-        if length > self.config.max_packet_length {
+        if length > self.max_packet_length {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 PacketTooLong(()),
@@ -125,7 +123,7 @@ impl Encoder<Packet> for Codec {
             .checked_add(4)
             .and_then(|len| u32::try_from(len).ok())
         {
-            Some(length) if length <= self.config.max_packet_length => length,
+            Some(length) if length <= self.max_packet_length => length,
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -166,15 +164,7 @@ mod tests {
 
     #[tokio::test]
     async fn encode_decode_roundtrip() {
-        let config = Config {
-            addrs: DhtAndSocketAddr {
-                dht_addr: DhtAddr::random(),
-                socket_addr: "1.2.3.4:5678".parse().unwrap(),
-            },
-            ttl: 42,
-            query_queue_size: 1,
-            max_packet_length: 1024,
-        };
+        let max_packet_length = 1024;
 
         let test_packet = Packet {
             src: DhtAndSocketAddr {
@@ -193,7 +183,7 @@ mod tests {
         };
 
         let stream = Cursor::new(Vec::new());
-        let codec = Codec::new(Arc::new(config));
+        let codec = Codec::new(max_packet_length);
         let mut framed = Framed::new(stream, codec);
 
         framed.send(test_packet.clone()).await.unwrap();
