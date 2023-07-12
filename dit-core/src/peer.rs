@@ -5,8 +5,9 @@
 mod proto;
 pub mod types;
 
-use self::proto::{Codec, Neighbors, Packet, Payload, PayloadKind};
+use self::proto::{Neighbors, Packet, Payload, PayloadKind};
 use self::types::{Fingers, SocketAddr};
+use crate::codec::Codec;
 use futures_util::{SinkExt, StreamExt};
 use std::collections::hash_map::{Entry, HashMap};
 use std::error::Error;
@@ -18,6 +19,8 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::codec::Framed;
 
 pub use self::types::{DhtAddr, DhtAndSocketAddr};
+
+type FramedStream = Framed<TcpStream, Codec<Packet>>;
 
 #[derive(Debug)]
 pub struct Config {
@@ -403,14 +406,14 @@ impl Controller {
         response_receiver.await.map_err(|_| ConnectionClosed(()))
     }
 
-    async fn connect(&self, socket_addr: SocketAddr) -> io::Result<Framed<TcpStream, Codec>> {
+    async fn connect(&self, socket_addr: SocketAddr) -> io::Result<FramedStream> {
         let stream = TcpStream::connect(socket_addr).await?;
         tracing::debug!(?socket_addr, "outbound connection established");
         let codec = Codec::new(self.config.max_packet_length);
         Ok(Framed::new(stream, codec))
     }
 
-    async fn disconnect(&self, mut framed: Framed<TcpStream, Codec>) -> io::Result<()> {
+    async fn disconnect(&self, mut framed: FramedStream) -> io::Result<()> {
         let socket_addr = framed.get_ref().peer_addr();
         framed.close().await?;
         if let Some(packet) = framed.next().await.transpose()? {
@@ -426,7 +429,7 @@ impl Controller {
 
     async fn send_packet(
         &self,
-        framed: &mut Framed<TcpStream, Codec>,
+        framed: &mut FramedStream,
         src: DhtAddr,
         dst: DhtAddr,
         payload: Payload,
@@ -545,7 +548,7 @@ impl RemotePeer {
 impl RemotePeerGuard {
     async fn process_packet(
         &mut self,
-        _src_framed: &mut Framed<TcpStream, Codec>,
+        _src_framed: &mut FramedStream,
         packet: Packet,
     ) -> io::Result<()> {
         tracing::debug!(?packet, "received packet");
