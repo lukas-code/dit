@@ -167,7 +167,7 @@ mod tests {
     #[tokio::test]
     async fn encode_decode_roundtrip() {
         let config = Config {
-            addr: DhtAndSocketAddr {
+            addrs: DhtAndSocketAddr {
                 dht_addr: DhtAddr::random(),
                 socket_addr: "1.2.3.4:5678".parse().unwrap(),
             },

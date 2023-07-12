@@ -27,7 +27,7 @@ pub async fn run(args: Args) {
     match args.command {
         Command::Daemon => {
             let config1 = Config {
-                addr: DhtAndSocketAddr {
+                addrs: DhtAndSocketAddr {
                     dht_addr: DhtAddr::random(),
                     socket_addr: "127.0.0.1:6660".parse().unwrap(),
                 },
@@ -37,7 +37,7 @@ pub async fn run(args: Args) {
             };
 
             let config2 = Config {
-                addr: DhtAndSocketAddr {
+                addrs: DhtAndSocketAddr {
                     dht_addr: DhtAddr::random(),
                     socket_addr: "127.0.0.1:6661".parse().unwrap(),
                 },
