@@ -94,10 +94,7 @@ impl Decoder for Codec {
         let length = u32::from_be_bytes(length_bytes);
 
         if length > self.max_packet_length {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                PacketTooLong(()),
-            ));
+            return Err(invalid_data(PacketTooLong(())));
         }
 
         let length = length.try_into().unwrap();
@@ -107,7 +104,7 @@ impl Decoder for Codec {
             return Ok(None);
         }
 
-        let packet = serde_json::from_slice(&src[4..length])?;
+        let packet = rmp_serde::from_slice(&src[4..length]).map_err(invalid_data)?;
         src.advance(length);
         Ok(Some(packet))
     }
@@ -117,7 +114,7 @@ impl Encoder<Packet> for Codec {
     type Error = io::Error;
 
     fn encode(&mut self, packet: Packet, dst: &mut BytesMut) -> Result<(), Self::Error> {
-        let encoded_packet = serde_json::to_vec(&packet)?;
+        let encoded_packet = rmp_serde::to_vec_named(&packet).map_err(invalid_data)?;
 
         let length = match encoded_packet
             .len()
@@ -140,6 +137,10 @@ impl Encoder<Packet> for Codec {
 
         Ok(())
     }
+}
+
+fn invalid_data(error: impl Error + Send + Sync + 'static) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, error)
 }
 
 /// Error returned by [`Codec::encode`] and [`Codec::decode`] if a packet is longer than the
