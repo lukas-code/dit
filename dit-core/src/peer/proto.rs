@@ -1,13 +1,6 @@
-use super::Config;
 use super::{DhtAddr, DhtAndSocketAddr, SocketAddr};
 
-use bytes::{Buf, BytesMut};
 use serde::{Deserialize, Serialize};
-use std::error::Error;
-use std::fmt;
-use std::sync::Arc;
-use tokio::io;
-use tokio_util::codec::{Decoder, Encoder};
 
 /// A datagram that can be routed though the peer-to-peer network.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,139 +64,72 @@ pub struct Neighbors {
     pub succ: Option<DhtAndSocketAddr>,
 }
 
-pub struct Codec {
-    config: Arc<Config>,
-}
-
-impl Codec {
-    pub fn new(config: Arc<Config>) -> Self {
-        Self { config }
-    }
-}
-
-impl Decoder for Codec {
-    type Item = Packet;
-    type Error = io::Error;
-
-    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        if src.len() < 4 {
-            return Ok(None);
-        }
-
-        let mut length_bytes = [0; 4];
-        length_bytes.copy_from_slice(&src[..4]);
-        let length = u32::from_be_bytes(length_bytes);
-
-        if length > self.config.max_packet_length {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                PacketTooLong(()),
-            ));
-        }
-
-        let length = length.try_into().unwrap();
-
-        if src.len() < length {
-            src.reserve(length - src.len());
-            return Ok(None);
-        }
-
-        let packet = serde_json::from_slice(&src[4..])?;
-        src.advance(length);
-        Ok(Some(packet))
-    }
-}
-
-impl Encoder<Packet> for Codec {
-    type Error = io::Error;
-
-    fn encode(&mut self, packet: Packet, dst: &mut BytesMut) -> Result<(), Self::Error> {
-        let encoded_packet = serde_json::to_vec(&packet)?;
-
-        let length = match encoded_packet
-            .len()
-            .checked_add(4)
-            .and_then(|len| u32::try_from(len).ok())
-        {
-            Some(length) if length <= self.config.max_packet_length => length,
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    PacketTooLong(()),
-                ))
-            }
-        };
-
-        let length_bytes = length.to_be_bytes();
-        dst.reserve(encoded_packet.len() + 4);
-        dst.extend_from_slice(&length_bytes);
-        dst.extend_from_slice(&encoded_packet);
-
-        Ok(())
-    }
-}
-
-/// Error returned by [`Codec::encode`] and [`Codec::decode`] if a packet is longer than the
-/// configured maximum length.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PacketTooLong(());
-
-impl fmt::Display for PacketTooLong {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("packet too long")
-    }
-}
-
-impl Error for PacketTooLong {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    use crate::codec::Codec;
     use futures_util::{SinkExt, StreamExt};
-    use std::io::Cursor;
+    use tokio::io;
     use tokio_util::codec::Framed;
 
     #[tokio::test]
     async fn encode_decode_roundtrip() {
-        let config = Config {
-            addrs: DhtAndSocketAddr {
-                dht_addr: DhtAddr::random(),
-                socket_addr: "1.2.3.4:5678".parse().unwrap(),
-            },
-            ttl: 42,
-            query_queue_size: 1,
-            max_packet_length: 1024,
-        };
+        let max_packet_length = 1024;
 
-        let test_packet = Packet {
-            src: DhtAndSocketAddr {
-                dht_addr: DhtAddr::random(),
-                socket_addr: "[::1]:1".parse().unwrap(),
+        let test_packets = [
+            Packet {
+                src: DhtAndSocketAddr {
+                    dht_addr: DhtAddr::random(),
+                    socket_addr: "1.2.3.4:5".parse().unwrap(),
+                },
+                dst: DhtAddr::random(),
+                ttl: 123,
+                payload: Payload::NeighborsRequest,
             },
-            dst: DhtAddr::random(),
-            ttl: 123,
-            payload: Payload::NeighborsResponse(Neighbors {
-                pred: Some(DhtAndSocketAddr {
-                    dht_addr: DhtAddr::hash(b"pred"),
-                    socket_addr: "[FEED::]:0".parse().unwrap(),
+            Packet {
+                src: DhtAndSocketAddr {
+                    dht_addr: DhtAddr::random(),
+                    socket_addr: "[::1]:1".parse().unwrap(),
+                },
+                dst: DhtAddr::random(),
+                ttl: 456,
+                payload: Payload::NeighborsResponse(Neighbors {
+                    pred: Some(DhtAndSocketAddr {
+                        dht_addr: DhtAddr::hash(b"pred"),
+                        socket_addr: "[FEED::]:0".parse().unwrap(),
+                    }),
+                    succ: None,
                 }),
-                succ: None,
-            }),
-        };
+            },
+        ];
 
-        let stream = Cursor::new(Vec::new());
-        let codec = Codec::new(Arc::new(config));
-        let mut framed = Framed::new(stream, codec);
+        for buffer_size in [1, 16, 1024] {
+            let (sender, receiver) = io::duplex(buffer_size);
+            let codec = Codec::new(max_packet_length);
+            let mut framed_sender = Framed::new(sender, codec);
+            let mut framed_receiver = Framed::new(receiver, codec);
 
-        framed.send(test_packet.clone()).await.unwrap();
-        let bytes_sent = framed.get_ref().position();
+            let send_packets = test_packets.clone();
+            let sender_task = tokio::spawn(async move {
+                for packet in send_packets {
+                    framed_sender.send(packet).await.unwrap();
+                }
+                framed_sender.close().await.unwrap();
+            });
 
-        framed.get_mut().set_position(0);
-        let received = framed.next().await.unwrap().unwrap();
-        let bytes_received = framed.get_ref().position();
+            let receiver_task = tokio::spawn(async move {
+                let mut received_packets = Vec::new();
+                while let Some(packet) = framed_receiver.next().await.transpose().unwrap() {
+                    received_packets.push(packet);
+                }
+                received_packets
+            });
 
-        assert_eq!(received, test_packet);
-        assert_eq!(bytes_sent, bytes_received);
+            sender_task.await.unwrap();
+            let received_packets = receiver_task.await.unwrap();
+
+            assert_eq!(received_packets, test_packets);
+        }
     }
 }
