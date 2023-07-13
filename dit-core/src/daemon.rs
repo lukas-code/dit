@@ -18,7 +18,7 @@ pub struct Config {
     pub daemon_config: DaemonConfig,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonConfig {
     pub socket_addr: SocketAddr,
 }

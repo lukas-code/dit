@@ -76,7 +76,6 @@ pub async fn run(args: Args) {
             socket_addr: "127.0.0.1:6660".parse().unwrap(),
         },
         ttl: 8,
-        query_queue_size: 1,
         max_packet_length: 1024,
     };
     let config = Config {
