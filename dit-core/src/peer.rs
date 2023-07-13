@@ -23,7 +23,7 @@ pub use self::types::{DhtAddr, DhtAndSocketAddr};
 type FramedStream = Framed<TcpStream, Codec<Packet>>;
 
 #[derive(Debug)]
-pub struct Config {
+pub struct PeerConfig {
     pub addrs: DhtAndSocketAddr,
     pub ttl: u32,
     pub query_queue_size: usize,
@@ -33,12 +33,12 @@ pub struct Config {
 #[derive(Debug)]
 pub struct Runtime {
     pub controller: Controller,
-    pub listener: Listener,
+    pub listener: RemoteListener,
     pub local_peer: LocalPeer,
 }
 
 impl Runtime {
-    pub async fn new(config: Config) -> io::Result<Self> {
+    pub async fn new(config: PeerConfig) -> io::Result<Self> {
         let tcp_listener = TcpListener::bind(config.addrs.socket_addr).await?;
 
         let (query_sender, query_receiver) = mpsc::channel(config.query_queue_size);
@@ -54,7 +54,7 @@ impl Runtime {
             shutdown_receiver,
         };
 
-        let listener = Listener {
+        let listener = RemoteListener {
             controller: controller.clone(),
             tcp_listener,
         };
@@ -95,7 +95,7 @@ struct Links {
 
 #[derive(Debug)]
 pub struct LocalPeer {
-    config: Arc<Config>,
+    config: Arc<PeerConfig>,
     query_receiver: mpsc::Receiver<Query>,
     event_receiver: mpsc::UnboundedReceiver<Event>,
     shutdown_sender: watch::Sender<bool>,
@@ -280,7 +280,7 @@ impl LocalPeer {
 
 #[derive(Debug, Clone)]
 pub struct Controller {
-    config: Arc<Config>,
+    config: Arc<PeerConfig>,
     query_sender: mpsc::Sender<Query>,
     event_sender: mpsc::UnboundedSender<Event>,
     shutdown_receiver: watch::Receiver<bool>,
@@ -469,12 +469,12 @@ impl From<ConnectionClosed> for io::Error {
 }
 
 #[derive(Debug)]
-pub struct Listener {
+pub struct RemoteListener {
     controller: Controller,
     tcp_listener: TcpListener,
 }
 
-impl Listener {
+impl RemoteListener {
     pub async fn accept(&self) -> io::Result<Option<RemotePeer>> {
         tokio::select! {
             biased;

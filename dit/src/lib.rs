@@ -3,10 +3,51 @@
 #![deny(rustdoc::broken_intra_doc_links)]
 
 use clap::{Parser, Subcommand};
-use dit_core::peer::{Config, DhtAddr, DhtAndSocketAddr, Runtime};
+use dit_core::daemon::{Config, ConnectionToDaemon, DaemonConfig, LocalListener, Packet};
+use dit_core::peer::{DhtAddr, DhtAndSocketAddr, PeerConfig, Runtime};
 use tokio::io;
+use tokio::net::TcpListener;
 use tracing::Instrument;
 use tracing_subscriber::filter::{EnvFilter, LevelFilter};
+
+pub async fn run_daemon(config: Config) -> Result<(), io::Error> {
+    let rt = Runtime::new(config.peer_config).await?;
+
+    let tcp_listener = TcpListener::bind(config.daemon_config.socket_addr).await?;
+
+    let mut local_listener = LocalListener { tcp_listener };
+
+    let listener = tokio::spawn(
+        async move {
+            loop {
+                let Some(inbound) = local_listener.accept().await? else {
+                    return Ok::<(), io::Error>(());
+                };
+
+                tokio::spawn(inbound.run().in_current_span());
+            }
+        }
+        .instrument(tracing::debug_span!("listener")),
+    );
+
+    let local_peer = tokio::spawn(
+        rt.local_peer
+            .run()
+            .instrument(tracing::debug_span!("local peer")),
+    );
+
+    // rt.controller
+    //     .bootstrap("127.0.0.1:6660".parse().unwrap())
+    //     .await
+    //     .unwrap();
+
+    let (listener_result, local_peer_result) = tokio::join!(listener, local_peer);
+
+    listener_result.unwrap().unwrap();
+    local_peer_result.unwrap();
+
+    Ok(())
+}
 
 #[derive(Debug, Parser)]
 pub struct Args {
@@ -18,86 +59,60 @@ pub struct Args {
 pub enum Command {
     /// Starts the daemon.
     Daemon,
+    /// Pings the daemon.
+    PingDaemon,
 }
 
 #[tracing::instrument(name = "run_cli", skip(args))]
 pub async fn run(args: Args) {
     tracing::debug!(?args);
 
+    let daemon_config = DaemonConfig {
+        socket_addr: "127.0.0.1:6661".parse().unwrap(),
+    };
+    let peer_config = PeerConfig {
+        addrs: DhtAndSocketAddr {
+            dht_addr: DhtAddr::random(),
+            socket_addr: "127.0.0.1:6660".parse().unwrap(),
+        },
+        ttl: 8,
+        query_queue_size: 1,
+        max_packet_length: 1024,
+    };
+    let config = Config {
+        daemon_config,
+        peer_config,
+    };
+
     match args.command {
         Command::Daemon => {
-            let config1 = Config {
-                addrs: DhtAndSocketAddr {
-                    dht_addr: DhtAddr::random(),
-                    socket_addr: "127.0.0.1:6660".parse().unwrap(),
-                },
-                ttl: 8,
-                query_queue_size: 1,
-                max_packet_length: 1024,
-            };
-
-            let config2 = Config {
-                addrs: DhtAndSocketAddr {
-                    dht_addr: DhtAddr::random(),
-                    socket_addr: "127.0.0.1:6661".parse().unwrap(),
-                },
-                ttl: 8,
-                query_queue_size: 1,
-                max_packet_length: 1024,
-            };
-
-            let rt1 = Runtime::new(config1).await.unwrap();
-            let rt2 = Runtime::new(config2).await.unwrap();
-
-            let listener1 = tokio::spawn(
-                async move {
-                    loop {
-                        let Some(remote) = rt1.listener.accept().await? else {
-                            return Ok::<(), io::Error>(());
-                        };
-
-                        tokio::spawn(remote.run().in_current_span());
-                    }
-                }
-                .instrument(tracing::debug_span!("listener 1")),
-            );
-
-            let listener2 = tokio::spawn(
-                async move {
-                    loop {
-                        let Some(remote) = rt2.listener.accept().await? else {
-                            return Ok::<(), io::Error>(());
-                        };
-
-                        tokio::spawn(remote.run().in_current_span());
-                    }
-                }
-                .instrument(tracing::debug_span!("listener 2")),
-            );
-
-            let local1 = tokio::spawn(
-                rt1.local_peer
-                    .run()
-                    .instrument(tracing::debug_span!("local 1")),
-            );
-            let local2 = tokio::spawn(
-                rt2.local_peer
-                    .run()
-                    .instrument(tracing::debug_span!("local 2")),
-            );
-
-            rt1.controller
-                .bootstrap("127.0.0.1:6661".parse().unwrap())
+            tracing::info!("Starting dit daemon");
+            run_daemon(config).await.unwrap();
+        }
+        Command::PingDaemon => {
+            // Connect to the daemon (get socket from toml)
+            let mut connection = ConnectionToDaemon::connect(config.daemon_config.socket_addr)
                 .await
                 .unwrap();
 
-            rt1.controller.shutdown().await.unwrap();
-            rt2.controller.shutdown().await.unwrap();
+            // Send a message to the daemon
+            connection.ping(42).await.unwrap(); // Sending a ping packet with 42 as value
 
-            local1.await.unwrap();
-            local2.await.unwrap();
-            listener1.await.unwrap().unwrap();
-            listener2.await.unwrap().unwrap();
+            // If you want to receive a packet (for example a pong) after sending ping
+            match connection.receive().await {
+                Ok(Some(Packet::Pong(value))) => {
+                    println!("Received Pong with value: {}", value);
+                }
+                Ok(Some(_)) => {
+                    println!("Received unexpected packet");
+                }
+                Ok(None) => {
+                    println!("No more packets to receive, connection was closed");
+                }
+                Err(e) => {
+                    eprintln!("An error occurred while receiving a packet: {}", e);
+                }
+            }
         }
     }
 }
