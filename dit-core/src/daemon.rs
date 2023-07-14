@@ -4,19 +4,12 @@
 //! manage the remote peers that connect to the listener.
 
 use crate::codec::Codec;
-use crate::peer::PeerConfig;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use tokio::io;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::codec::Framed;
-
-#[derive(Debug)]
-pub struct Config {
-    pub peer_config: PeerConfig,
-    pub daemon_config: DaemonConfig,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonConfig {
