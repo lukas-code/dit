@@ -94,14 +94,17 @@ pub async fn run(args: Args) {
             };
         }
         Command::Daemon => {
-            let Some(config) = read_config_or_report_error(&args.config) else {
+            let Ok(config) = read_config_or_report_error(&args.config) else {
+                return;
+            };
+            let Ok(()) = validate_config_for_running_peer(&config) else {
                 return;
             };
             tracing::info!("Starting dit daemon");
             run_daemon(config).await.unwrap();
         }
         Command::PingDaemon => {
-            let Some(config) = read_config_or_report_error(&args.config) else {
+            let Ok(config) = read_config_or_report_error(&args.config) else {
                 return;
             };
 
@@ -140,12 +143,22 @@ pub fn install_default_tracing_subscriber() {
     tracing_subscriber::fmt().with_env_filter(filter).init()
 }
 
-fn read_config_or_report_error(path: &Path) -> Option<GlobalConfig> {
-    match GlobalConfig::read(path) {
-        Ok(config) => Some(config),
-        Err(err) => {
-            eprintln!("{err}");
-            None
-        }
+/// Indicated that an error has been reported to the user and the program may exit.
+struct ErrorReported;
+
+fn read_config_or_report_error(path: &Path) -> Result<GlobalConfig, ErrorReported> {
+    GlobalConfig::read(path).map_err(|err| {
+        eprintln!("error: {err}");
+        ErrorReported
+    })
+}
+
+fn validate_config_for_running_peer(config: &GlobalConfig) -> Result<(), ErrorReported> {
+    if config.peer.addrs.socket_addr.ip().is_unspecified() {
+        eprintln!("error: invalid address for `peer.listener` in config");
+        eprintln!("help: replace `0.0.0.0` with your public ip address");
+        return Err(ErrorReported);
     }
+
+    Ok(())
 }

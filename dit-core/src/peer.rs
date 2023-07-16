@@ -38,6 +38,10 @@ pub struct Runtime {
 
 impl Runtime {
     pub async fn new(config: PeerConfig) -> io::Result<Self> {
+        assert!(
+            !config.addrs.socket_addr.ip().is_unspecified(),
+            "listener address must be specified",
+        );
         let tcp_listener = TcpListener::bind(config.addrs.socket_addr).await?;
 
         let (query_sender, query_receiver) = mpsc::channel(1);
