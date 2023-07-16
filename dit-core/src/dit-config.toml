@@ -10,6 +10,12 @@ listener = "0.0.0.0:7700"
 # How many times a packet is forwarded on the peer-to-peer network before it is discarded.
 #ttl = 16
 
+# The maximum duration the peer will wait for a connection to establish.
+#connect_timeout = 1000 # ms
+
+# The maximum duration the peer will wait for a response.
+#response_timeout = 1000 # ms
+
 # The maximum size of a peer-to-peer packet. Larger packets are discarded.
 #max_packet_length = 1024
 

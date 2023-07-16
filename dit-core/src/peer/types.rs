@@ -87,14 +87,6 @@ impl DhtAddr {
         }
         self
     }
-
-    pub fn wrapping_distance(self, other: Self) -> Self {
-        if self >= other {
-            self.wrapping_sub(other)
-        } else {
-            other.wrapping_sub(self)
-        }
-    }
 }
 
 impl fmt::Display for DhtAddr {
@@ -226,21 +218,12 @@ pub struct DhtAndSocketAddr {
 /// The table of successors of a peer.
 ///
 /// finger(index) = successor(self_addr + 2<sup>index</sup>)
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Fingers {
     map: BTreeMap<usize, DhtAndSocketAddr>,
 }
 
 impl Fingers {
-    /// Returns the finger index of `dst_addr` for a peer with `self_addr`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `self_addr == dst_addr`.
-    pub fn index_of(self_addr: DhtAddr, dst_addr: DhtAddr) -> usize {
-        dst_addr.wrapping_sub(self_addr).log2()
-    }
-
     /// Returns an empty finger table.
     pub const fn new() -> Self {
         Self {
@@ -248,37 +231,65 @@ impl Fingers {
         }
     }
 
-    /// Inserts a new finger at the index, returning the previous finger.
-    #[track_caller]
-    pub fn insert(&mut self, index: usize, addrs: DhtAndSocketAddr) -> Option<DhtAndSocketAddr> {
-        assert!(index < DhtAddr::BITS, "Fingers: index out of bounds");
-        self.map.insert(index, addrs)
+    /// Inserts or replaces a finger.
+    ///
+    /// If the slot has a closer finger, this method is a no-op and returns `None`.
+    ///
+    /// If the slot has a further finer, it is replaced and the old finger is returned.
+    pub fn insert(
+        &mut self,
+        self_addr: DhtAddr,
+        addrs: DhtAndSocketAddr,
+    ) -> Option<DhtAndSocketAddr> {
+        let index = Self::index_of(self_addr, addrs.dht_addr);
+        let old = self.map.get(&index);
+        if !old.is_some_and(|old| {
+            old.dht_addr.wrapping_sub(self_addr) <= addrs.dht_addr.wrapping_sub(self_addr)
+        }) {
+            self.map.insert(index, addrs)
+        } else {
+            None
+        }
     }
 
-    /// Removes the finger at the index, returning it.
-    #[track_caller]
-    pub fn remove(&mut self, index: usize) -> Option<DhtAndSocketAddr> {
-        assert!(index < DhtAddr::BITS, "Fingers: index out of bounds");
+    /// Removes a finger.
+    pub fn remove(&mut self, self_addr: DhtAddr, dst_addr: DhtAddr) -> Option<DhtAndSocketAddr> {
+        let index = Self::index_of(self_addr, dst_addr);
         self.map.remove(&index)
     }
 
-    /// Returns a finger at the index or below.
-    #[track_caller]
-    pub fn get(&self, index: usize) -> Option<&DhtAndSocketAddr> {
-        assert!(index < DhtAddr::BITS, "Fingers: index out of bounds");
-        // if a key in `0..index` exists, return the value at the greatest of those keys,
-        // otherwise return the value for the smallest key
+    /// Returns the finger that should be used for routing from `self_addr` to `dst_addr`.
+    ///
+    /// Ideally, this is the finger furthest from `self_addr` and below `dst_addr`.
+    /// If there is no finger below `dst_addr`, then the finger closest to `self_addr` is returned.
+    pub fn get_route(&self, self_addr: DhtAddr, dst_addr: DhtAddr) -> Option<&DhtAndSocketAddr> {
+        let max_index = Self::index_of(self_addr, dst_addr);
+        let distance_to_dst = dst_addr.wrapping_sub(self_addr);
         self.map
-            .range(..=index)
-            .next_back()
+            .range(..=max_index)
+            .rev()
+            .find(|(_, addrs)| addrs.dht_addr.wrapping_sub(self_addr) <= distance_to_dst)
             .or_else(|| self.map.first_key_value())
             .map(|(_, addrs)| addrs)
+    }
+
+    /// Returns the finger index of `dst_addr` for a peer with `self_addr`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `self_addr == dst_addr`.
+    fn index_of(self_addr: DhtAddr, dst_addr: DhtAddr) -> usize {
+        dst_addr.wrapping_sub(self_addr).log2()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn addr(s: &str) -> DhtAddr {
+        s.parse().unwrap()
+    }
 
     #[test]
     fn dht_addr_hash() {
@@ -357,16 +368,12 @@ mod tests {
     #[test]
     fn log2() {
         assert_eq!(
-            DhtAddr::from_str("0000000000000000000000000000000000000000000000000000000000000001")
-                .unwrap()
-                .log2(),
+            addr("0000000000000000000000000000000000000000000000000000000000000001").log2(),
             0,
         );
 
         assert_eq!(
-            DhtAddr::from_str("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
-                .unwrap()
-                .log2(),
+            addr("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff").log2(),
             255,
         );
     }
@@ -381,26 +388,70 @@ mod tests {
     fn fingers_insert_get() {
         let mut fingers = Fingers::new();
 
-        let addrs1 = DhtAndSocketAddr {
-            dht_addr: "0000000000000000000000000000000000000000000000000000000000000001"
-                .parse()
-                .unwrap(),
+        let self_addr = addr("8000000000000000000000000000000000000000000000000000000000000000");
+
+        let addrs_close = DhtAndSocketAddr {
+            dht_addr: addr("C000000000000000000000000000000000000000000000000000000000000000"),
             socket_addr: "0.0.0.0:1".parse().unwrap(),
         };
-        fingers.insert(1, addrs1);
+        assert_eq!(fingers.insert(self_addr, addrs_close), None);
 
-        let addrs2 = DhtAndSocketAddr {
-            dht_addr: "0000000000000000000000000000000000000000000000000000000000000002"
-                .parse()
-                .unwrap(),
+        let addrs_far = DhtAndSocketAddr {
+            dht_addr: addr("4000000000000000000000000000000000000000000000000000000000000000"),
             socket_addr: "0.0.0.0:2".parse().unwrap(),
         };
-        fingers.insert(3, addrs2);
+        assert_eq!(fingers.insert(self_addr, addrs_far), None);
 
-        assert_eq!(fingers.get(0), Some(&addrs1));
-        assert_eq!(fingers.get(1), Some(&addrs1));
-        assert_eq!(fingers.get(2), Some(&addrs1));
-        assert_eq!(fingers.get(3), Some(&addrs2));
-        assert_eq!(fingers.get(4), Some(&addrs2));
+        assert_eq!(
+            fingers.get_route(
+                self_addr,
+                addr("4000000000000000000000000000000000000000000000000000000000000000"),
+            ),
+            Some(&addrs_far)
+        );
+
+        assert_eq!(
+            fingers.get_route(
+                self_addr,
+                addr("4000000000000000000000000000000000000000000000000000000000000001"),
+            ),
+            Some(&addrs_far)
+        );
+
+        assert_eq!(
+            fingers.get_route(
+                self_addr,
+                addr("3FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"),
+            ),
+            Some(&addrs_close)
+        );
+
+        let addrs_far_further = DhtAndSocketAddr {
+            dht_addr: addr("4000000000000000000000000000000000000000000000000000000000000001"),
+            socket_addr: "0.0.0.0:3".parse().unwrap(),
+        };
+        assert_eq!(fingers.insert(self_addr, addrs_far_further), None);
+
+        assert_eq!(
+            fingers.get_route(
+                self_addr,
+                addr("4000000000000000000000000000000000000000000000000000000000000001"),
+            ),
+            Some(&addrs_far)
+        );
+
+        let addrs_far_closer = DhtAndSocketAddr {
+            dht_addr: addr("3FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"),
+            socket_addr: "0.0.0.0:3".parse().unwrap(),
+        };
+        assert_eq!(fingers.insert(self_addr, addrs_far_closer), Some(addrs_far));
+
+        assert_eq!(
+            fingers.get_route(
+                self_addr,
+                addr("4000000000000000000000000000000000000000000000000000000000000000"),
+            ),
+            Some(&addrs_far_closer)
+        );
     }
 }
