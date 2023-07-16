@@ -74,7 +74,7 @@ impl Runtime {
             inbound_connections: HashMap::default(),
             next_subscription_id: SubscriptionId(0),
             subscriptions_by_id: HashMap::default(),
-            subscriptions_by_kind: HashMap::default(),
+            subscriptions_by_addr: HashMap::default(),
             links: Links::default(),
         };
 
@@ -99,6 +99,21 @@ struct Links {
     successors: Fingers,
 }
 
+struct SubscriptionData {
+    response: oneshot::Sender<Packet>,
+    src_addr: DhtAddr,
+    predicate: Box<dyn FnMut(&Payload) -> bool>,
+}
+
+impl fmt::Debug for SubscriptionData {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SubscriptionData")
+            .field("response", &self.response)
+            .field("src_addr", &self.src_addr)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug)]
 pub struct LocalPeer {
     config: Arc<PeerConfig>,
@@ -108,8 +123,8 @@ pub struct LocalPeer {
     next_connection_id: ConnectionId,
     inbound_connections: HashMap<ConnectionId, SocketAddr>,
     next_subscription_id: SubscriptionId,
-    subscriptions_by_id: HashMap<SubscriptionId, (oneshot::Sender<Packet>, DhtAddr, PayloadKind)>,
-    subscriptions_by_kind: HashMap<(DhtAddr, PayloadKind), Vec<SubscriptionId>>,
+    subscriptions_by_id: HashMap<SubscriptionId, SubscriptionData>,
+    subscriptions_by_addr: HashMap<DhtAddr, Vec<SubscriptionId>>,
     links: Links,
 }
 
@@ -160,8 +175,8 @@ impl LocalPeer {
                         Query::NotifySubscribers(response, packet) => {
                             let _ = response.send(self.process_notify_subscribers(packet));
                         }
-                        Query::Subscribe(response, dht_addr, payload_kind) => {
-                            let _ = response.send(self.process_subscribe(dht_addr, payload_kind));
+                        Query::Subscribe(response, dht_addr, predicate) => {
+                            let _ = response.send(self.process_subscribe(dht_addr, predicate));
                         }
                     }
                 }
@@ -218,36 +233,50 @@ impl LocalPeer {
     }
 
     fn process_notify_subscribers(&mut self, packet: Packet) {
-        let kind = (packet.src.dht_addr, packet.payload.kind());
-        if let Some(ids) = self.subscriptions_by_kind.remove(&kind) {
+        if let Entry::Occupied(mut entry_by_addr) =
+            self.subscriptions_by_addr.entry(packet.src.dht_addr)
+        {
+            let ids = entry_by_addr.get_mut();
             debug_assert!(!ids.is_empty());
-            tracing::trace!("notifying {} subscribers for {kind:?}", ids.len());
-            for id in ids {
-                let (sender, ..) = self
-                    .subscriptions_by_id
-                    .remove(&id)
-                    .expect("missing subscription id for notify");
-                let _ = sender.send(packet.clone());
+            ids.retain(|&id| {
+                let Entry::Occupied(mut entry_by_id) = self.subscriptions_by_id.entry(id) else {
+                    panic!("missing subscription id for notify");
+                };
+                let matches = (entry_by_id.get_mut().predicate)(&packet.payload);
+                if matches {
+                    tracing::trace!(?id, "notifying subscribers");
+                    let _ = entry_by_id.remove().response.send(packet.clone());
+                }
+                !matches
+            });
+            if ids.is_empty() {
+                entry_by_addr.remove();
             }
         } else {
-            tracing::trace!("no subscribers for {kind:?}");
+            tracing::trace!("no subscribers");
         }
     }
 
     fn process_subscribe(
         &mut self,
-        dht_addr: DhtAddr,
-        payload_kind: PayloadKind,
+        src_addr: DhtAddr,
+        predicate: Box<dyn FnMut(&Payload) -> bool>,
     ) -> (SubscriptionId, oneshot::Receiver<Packet>) {
         let id = self.next_subscription_id;
         self.next_subscription_id =
             SubscriptionId(id.0.checked_add(1).expect("subscription id overflow"));
 
         let (sender, receiver) = oneshot::channel();
-        self.subscriptions_by_id
-            .insert(id, (sender, dht_addr, payload_kind));
-        self.subscriptions_by_kind
-            .entry((dht_addr, payload_kind))
+        self.subscriptions_by_id.insert(
+            id,
+            SubscriptionData {
+                response: sender,
+                src_addr,
+                predicate,
+            },
+        );
+        self.subscriptions_by_addr
+            .entry(src_addr)
             .or_default()
             .push(id);
 
@@ -263,11 +292,11 @@ impl LocalPeer {
     }
 
     fn process_unsubscribe(&mut self, id: SubscriptionId) {
-        let Some((_, dht_addr, payload_kind)) = self.subscriptions_by_id.remove(&id) else {
+        let Some(subscription) = self.subscriptions_by_id.remove(&id) else {
             return;
         };
 
-        let Entry::Occupied(mut entry) = self.subscriptions_by_kind.entry((dht_addr, payload_kind))
+        let Entry::Occupied(mut entry) = self.subscriptions_by_addr.entry(subscription.src_addr)
         else {
             panic!("missing subscription entry for unsubscribe");
         };
@@ -329,7 +358,9 @@ impl Controller {
 
         let self_addr = self.config.addrs.dht_addr;
         let subscription = self
-            .query_subscribe(self_addr, PayloadKind::NeighborsResponse)
+            .query_subscribe(self_addr, |payload| {
+                payload.kind() == PayloadKind::NeighborsResponse
+            })
             .await?;
 
         self.send_packet_request(&mut framed, self_addr, Payload::NeighborsRequest)
@@ -388,9 +419,13 @@ impl Controller {
             .await
     }
 
-    async fn query_subscribe(&self, addr: DhtAddr, kind: PayloadKind) -> Response<Subscription> {
+    async fn query_subscribe(
+        &self,
+        src_addr: DhtAddr,
+        predicate: impl 'static + FnMut(&Payload) -> bool,
+    ) -> Response<Subscription> {
         let (id, receiver) = self
-            .send_query(|response| Query::Subscribe(response, addr, kind))
+            .send_query(|response| Query::Subscribe(response, src_addr, Box::new(predicate)))
             .await?;
         Ok(Subscription::new(self.clone(), id, receiver))
     }
@@ -704,7 +739,6 @@ impl From<NoRoute> for io::Error {
     }
 }
 
-#[derive(Debug)]
 enum Query {
     RemoteConnect(oneshot::Sender<ConnectionId>, SocketAddr),
     GetLinks(oneshot::Sender<Links>),
@@ -714,8 +748,23 @@ enum Query {
     Subscribe(
         oneshot::Sender<(SubscriptionId, oneshot::Receiver<Packet>)>,
         DhtAddr,
-        PayloadKind,
+        Box<dyn FnMut(&Payload) -> bool>,
     ),
+}
+
+impl fmt::Debug for Query {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RemoteConnect(_, arg1) => f.debug_tuple("RemoteConnect").field(arg1).finish(),
+            Self::GetLinks(_) => f.debug_tuple("GetLinks").finish(),
+            Self::AddLink(_, arg1) => f.debug_tuple("AddLink").field(arg1).finish(),
+            Self::RemoveLink(_, arg1) => f.debug_tuple("RemoveLink").field(arg1).finish(),
+            Self::NotifySubscribers(_, arg1) => {
+                f.debug_tuple("NotifySubscribers").field(arg1).finish()
+            }
+            Self::Subscribe(_, arg1, _) => f.debug_tuple("Subscribe").field(arg1).finish(),
+        }
+    }
 }
 
 #[derive(Debug)]
