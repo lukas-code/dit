@@ -37,12 +37,15 @@ pub struct Runtime {
 }
 
 impl Runtime {
-    pub async fn new(config: PeerConfig) -> io::Result<Self> {
+    pub async fn new(mut config: PeerConfig) -> io::Result<Self> {
         assert!(
             !config.addrs.socket_addr.ip().is_unspecified(),
             "listener address must be specified",
         );
         let tcp_listener = TcpListener::bind(config.addrs.socket_addr).await?;
+
+        // Replace port 0 with actual port number.
+        config.addrs.socket_addr = tcp_listener.local_addr()?;
 
         let (query_sender, query_receiver) = mpsc::channel(1);
         let (event_sender, event_receiver) = mpsc::unbounded_channel();
@@ -290,6 +293,10 @@ pub struct Controller {
 }
 
 impl Controller {
+    pub fn config(&self) -> &PeerConfig {
+        &self.config
+    }
+
     /// Completes when the connection to the [`LocalPeer`] has been closed.
     pub async fn closed(&self) {
         self.query_sender.closed().await
@@ -325,7 +332,7 @@ impl Controller {
             .query_subscribe(self_addr, PayloadKind::NeighborsResponse)
             .await?;
 
-        self.send_packet(&mut framed, self_addr, self_addr, Payload::NeighborsRequest)
+        self.send_packet_request(&mut framed, self_addr, Payload::NeighborsRequest)
             .await?;
 
         let response_packet = subscription.recv().await?; // <- TODO: timeout
@@ -430,23 +437,38 @@ impl Controller {
         Ok(())
     }
 
-    async fn send_packet(
+    async fn send_packet_request(
         &self,
         framed: &mut FramedStream,
-        src: DhtAddr,
         dst: DhtAddr,
         payload: Payload,
     ) -> io::Result<()> {
         let packet = Packet {
-            src: DhtAndSocketAddr {
-                dht_addr: src,
-                socket_addr: self.config.addrs.socket_addr,
-            },
+            src: self.config.addrs,
             dst,
             ttl: self.config.ttl,
             payload,
         };
-        tracing::trace!(?packet, socket_addr = ?framed.get_ref().peer_addr(), "sending packet");
+        tracing::trace!(?packet, socket_addr = ?framed.get_ref().peer_addr(), "sending packet (request)");
+        framed.send(packet).await
+    }
+
+    async fn send_packet_response(
+        &self,
+        framed: &mut FramedStream,
+        request: &Packet,
+        payload: Payload,
+    ) -> io::Result<()> {
+        let packet = Packet {
+            src: DhtAndSocketAddr {
+                dht_addr: request.dst,
+                socket_addr: self.config.addrs.socket_addr,
+            },
+            dst: request.src.dht_addr,
+            ttl: self.config.ttl,
+            payload,
+        };
+        tracing::trace!(?packet, socket_addr = ?framed.get_ref().peer_addr(), "sending packet (response)");
         framed.send(packet).await
     }
 }
@@ -529,7 +551,7 @@ impl RemotePeer {
     }
 
     #[tracing::instrument(name = "run_remote", skip(self), fields(self.id))]
-    pub async fn run(mut self) -> io::Result<()> {
+    pub async fn run(self) -> io::Result<()> {
         tracing::debug!("starting remote peer");
         let codec = Codec::new(self.guard.controller.config.max_packet_length);
         let mut framed = Framed::new(self.stream, codec);
@@ -549,46 +571,136 @@ impl RemotePeer {
 }
 
 impl RemotePeerGuard {
+    /// Handle an inbound packet from an inbound connection.
+    ///
+    /// If this function returns `Err`, the connection is closed.
     async fn process_packet(
-        &mut self,
+        &self,
         _src_framed: &mut FramedStream,
-        packet: Packet,
+        mut packet: Packet,
     ) -> io::Result<()> {
         tracing::debug!(?packet, "received packet");
-        let links = self.controller.query_get_links().await?;
+        let mut old_links = None;
+        let mut links = self.controller.query_get_links().await?;
         self.controller
             .query_notify_subscribers(packet.clone())
             .await?;
 
-        let self_addrs = self.controller.config.addrs;
+        let self_dht_addr = self.controller.config.addrs.dht_addr;
+
+        // If we don't have a predecessor, assume the packet targets self for now.
+        let targets_self = links.predecessor.map_or(true, |pred| {
+            Self::packet_targets_self(self_dht_addr, pred.dht_addr, packet.dst)
+        });
 
         // TODO: check if we already have this link and if we don't then ping the peer before adding.
-        if packet.src.dht_addr != self_addrs.dht_addr {
-            // the bootstrapping response has src and dst set to self_addr.
+        // Note that the bootstrapping response has src and dst set to `self_dht_addr`.
+        if packet.src.dht_addr != self_dht_addr {
             self.controller.query_add_link(packet.src).await?;
+            old_links = Some(links);
+            links = self.controller.query_get_links().await?;
         }
 
-        // TODO: do something with packet, forward it if needed
-        // (the following is a placeholder to get the basics working)
-        if packet.payload.kind() == PayloadKind::NeighborsRequest {
-            let mut dst_framed = self.controller.connect(packet.src.socket_addr).await?;
-
-            let neighbors = Neighbors {
-                pred: Some(links.predecessor.unwrap_or(self_addrs)),
-                succ: Some(links.successors.get(0).copied().unwrap_or(self_addrs)),
-            };
-
-            self.controller
-                .send_packet(
-                    &mut dst_framed,
-                    packet.src.dht_addr,
-                    packet.src.dht_addr,
-                    Payload::NeighborsResponse(neighbors),
-                )
-                .await?;
+        if targets_self {
+            return self
+                .process_self_packet(packet, &links, old_links.as_ref())
+                .await;
         }
+
+        if packet.ttl == 0 {
+            tracing::debug!("packet reached end of TTL, discarding it");
+            return Ok(());
+        }
+        packet.ttl -= 1;
+
+        // Packet doesn't target self, forward it.
+        let mut finger_framed = self.connect_finger(packet.dst, &links).await?;
+        tracing::debug!("forwarding packet");
+        finger_framed.send(packet).await?;
+        self.controller.disconnect(finger_framed).await?;
 
         Ok(())
+    }
+
+    async fn process_self_packet(
+        &self,
+        packet: Packet,
+        links: &Links,
+        old_links: Option<&Links>,
+    ) -> io::Result<()> {
+        tracing::debug!("packet targets self");
+
+        match packet.payload {
+            Payload::Ping(n) => {
+                let mut finger_framed = self.connect_finger(packet.src.dht_addr, links).await?;
+                self.controller
+                    .send_packet_response(&mut finger_framed, &packet, Payload::Pong(n))
+                    .await?;
+                self.controller.disconnect(finger_framed).await?;
+                Ok(())
+            }
+            Payload::NeighborsRequest => {
+                let mut finger_framed = self.connect_finger(packet.src.dht_addr, links).await?;
+
+                let neighbors = Neighbors {
+                    pred: old_links.unwrap_or(links).predecessor,
+                    succ: Some(self.controller.config.addrs),
+                };
+
+                self.controller
+                    .send_packet_response(
+                        &mut finger_framed,
+                        &packet,
+                        Payload::NeighborsResponse(neighbors),
+                    )
+                    .await?;
+
+                self.controller.disconnect(finger_framed).await?;
+
+                Ok(())
+            }
+            _ => {
+                tracing::error!(kind = ?packet.payload.kind(), "unexpected inbound packet");
+                Err(io::ErrorKind::InvalidData.into())
+            }
+        }
+    }
+
+    async fn connect_finger(&self, dst_addr: DhtAddr, links: &Links) -> io::Result<FramedStream> {
+        // TODO: Handle case where peer is not reachable. Also timeout.
+        let index = Fingers::index_of(self.controller.config.addrs.dht_addr, dst_addr);
+        let Some(finger_addrs) = links.successors.get(index) else {
+            tracing::error!("packet doesn't target self and we don't have fingers");
+            return Err(NoRoute(()).into());
+        };
+        tracing::trace!(index, ?finger_addrs, "connecting to finger");
+        self.controller.connect(finger_addrs.socket_addr).await
+    }
+
+    fn packet_targets_self(self_addr: DhtAddr, pred_addr: DhtAddr, dst_addr: DhtAddr) -> bool {
+        if pred_addr < self_addr {
+            dst_addr > pred_addr && dst_addr <= self_addr
+        } else {
+            dst_addr > pred_addr || dst_addr <= self_addr
+        }
+    }
+}
+
+/// A peer cannot be reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NoRoute(());
+
+impl fmt::Display for NoRoute {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("no route to target")
+    }
+}
+
+impl Error for NoRoute {}
+
+impl From<NoRoute> for io::Error {
+    fn from(err: NoRoute) -> Self {
+        Self::new(io::ErrorKind::Other, err)
     }
 }
 
@@ -645,5 +757,152 @@ impl Subscription {
 
     async fn recv(self) -> Response<Packet> {
         self.receiver.await.map_err(|_| ConnectionClosed(()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn addr(s: &str) -> DhtAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn packet_targets_self() {
+        {
+            let self_addr =
+                addr("0000000000000000000000000000000000000000000000000000000000000000");
+            let pred_addr =
+                addr("8000000000000000000000000000000000000000000000000000000000000000");
+            assert!(RemotePeerGuard::packet_targets_self(
+                self_addr,
+                pred_addr,
+                addr("0000000000000000000000000000000000000000000000000000000000000000"),
+            ));
+            assert!(!RemotePeerGuard::packet_targets_self(
+                self_addr,
+                pred_addr,
+                addr("0000000000000000000000000000000000000000000000000000000000000001"),
+            ));
+            assert!(!RemotePeerGuard::packet_targets_self(
+                self_addr,
+                pred_addr,
+                addr("8000000000000000000000000000000000000000000000000000000000000000"),
+            ));
+            assert!(RemotePeerGuard::packet_targets_self(
+                self_addr,
+                pred_addr,
+                addr("8000000000000000000000000000000000000000000000000000000000000001"),
+            ));
+            assert!(RemotePeerGuard::packet_targets_self(
+                self_addr,
+                pred_addr,
+                addr("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
+            ));
+        }
+        {
+            let self_addr =
+                addr("8000000000000000000000000000000000000000000000000000000000000000");
+            let pred_addr =
+                addr("0000000000000000000000000000000000000000000000000000000000000000");
+            assert!(!RemotePeerGuard::packet_targets_self(
+                self_addr,
+                pred_addr,
+                addr("0000000000000000000000000000000000000000000000000000000000000000"),
+            ));
+            assert!(RemotePeerGuard::packet_targets_self(
+                self_addr,
+                pred_addr,
+                addr("0000000000000000000000000000000000000000000000000000000000000001"),
+            ));
+            assert!(!RemotePeerGuard::packet_targets_self(
+                self_addr,
+                pred_addr,
+                addr("8000000000000000000000000000000000000000000000000000000000000001"),
+            ));
+            assert!(RemotePeerGuard::packet_targets_self(
+                self_addr,
+                pred_addr,
+                addr("8000000000000000000000000000000000000000000000000000000000000000"),
+            ));
+            assert!(!RemotePeerGuard::packet_targets_self(
+                self_addr,
+                pred_addr,
+                addr("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
+            ));
+        }
+        {
+            let self_addr =
+                addr("4000000000000000000000000000000000000000000000000000000000000000");
+            let pred_addr =
+                addr("c000000000000000000000000000000000000000000000000000000000000000");
+            assert!(RemotePeerGuard::packet_targets_self(
+                self_addr,
+                pred_addr,
+                addr("0000000000000000000000000000000000000000000000000000000000000000"),
+            ));
+            assert!(RemotePeerGuard::packet_targets_self(
+                self_addr,
+                pred_addr,
+                addr("4000000000000000000000000000000000000000000000000000000000000000"),
+            ));
+            assert!(!RemotePeerGuard::packet_targets_self(
+                self_addr,
+                pred_addr,
+                addr("4000000000000000000000000000000000000000000000000000000000000001"),
+            ));
+            assert!(!RemotePeerGuard::packet_targets_self(
+                self_addr,
+                pred_addr,
+                addr("c000000000000000000000000000000000000000000000000000000000000000"),
+            ));
+            assert!(RemotePeerGuard::packet_targets_self(
+                self_addr,
+                pred_addr,
+                addr("c000000000000000000000000000000000000000000000000000000000000001"),
+            ));
+            assert!(RemotePeerGuard::packet_targets_self(
+                self_addr,
+                pred_addr,
+                addr("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
+            ));
+        }
+        {
+            let self_addr =
+                addr("c000000000000000000000000000000000000000000000000000000000000000");
+            let pred_addr =
+                addr("4000000000000000000000000000000000000000000000000000000000000000");
+            assert!(!RemotePeerGuard::packet_targets_self(
+                self_addr,
+                pred_addr,
+                addr("0000000000000000000000000000000000000000000000000000000000000000"),
+            ));
+            assert!(!RemotePeerGuard::packet_targets_self(
+                self_addr,
+                pred_addr,
+                addr("4000000000000000000000000000000000000000000000000000000000000000"),
+            ));
+            assert!(RemotePeerGuard::packet_targets_self(
+                self_addr,
+                pred_addr,
+                addr("4000000000000000000000000000000000000000000000000000000000000001"),
+            ));
+            assert!(RemotePeerGuard::packet_targets_self(
+                self_addr,
+                pred_addr,
+                addr("c000000000000000000000000000000000000000000000000000000000000000"),
+            ));
+            assert!(!RemotePeerGuard::packet_targets_self(
+                self_addr,
+                pred_addr,
+                addr("c000000000000000000000000000000000000000000000000000000000000001"),
+            ));
+            assert!(!RemotePeerGuard::packet_targets_self(
+                self_addr,
+                pred_addr,
+                addr("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
+            ));
+        }
     }
 }
