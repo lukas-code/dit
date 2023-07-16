@@ -9,6 +9,7 @@ use self::proto::{Neighbors, Packet, Payload, PayloadKind};
 use self::types::{Fingers, SocketAddr};
 use crate::codec::Codec;
 use futures_util::{SinkExt, StreamExt};
+use rand::Rng;
 use std::collections::hash_map::{Entry, HashMap};
 use std::error::Error;
 use std::fmt;
@@ -97,21 +98,6 @@ struct SubscriptionId(u64);
 struct Links {
     predecessor: Option<DhtAndSocketAddr>,
     successors: Fingers,
-}
-
-struct SubscriptionData {
-    response: oneshot::Sender<Packet>,
-    src_addr: DhtAddr,
-    predicate: Box<dyn FnMut(&Payload) -> bool>,
-}
-
-impl fmt::Debug for SubscriptionData {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SubscriptionData")
-            .field("response", &self.response)
-            .field("src_addr", &self.src_addr)
-            .finish_non_exhaustive()
-    }
 }
 
 #[derive(Debug)]
@@ -232,7 +218,7 @@ impl LocalPeer {
         }
     }
 
-    fn process_notify_subscribers(&mut self, packet: Packet) {
+    fn process_notify_subscribers(&mut self, packet: Packet) -> bool {
         if let Entry::Occupied(mut entry_by_addr) =
             self.subscriptions_by_addr.entry(packet.src.dht_addr)
         {
@@ -244,7 +230,7 @@ impl LocalPeer {
                 };
                 let matches = (entry_by_id.get_mut().predicate)(&packet.payload);
                 if matches {
-                    tracing::trace!(?id, "notifying subscribers");
+                    tracing::trace!(?id, "notifying subscriber");
                     let _ = entry_by_id.remove().response.send(packet.clone());
                 }
                 !matches
@@ -252,15 +238,17 @@ impl LocalPeer {
             if ids.is_empty() {
                 entry_by_addr.remove();
             }
+            true
         } else {
             tracing::trace!("no subscribers");
+            false
         }
     }
 
     fn process_subscribe(
         &mut self,
         src_addr: DhtAddr,
-        predicate: Box<dyn FnMut(&Payload) -> bool>,
+        predicate: Box<dyn FnMut(&Payload) -> bool + Send>,
     ) -> (SubscriptionId, oneshot::Receiver<Packet>) {
         let id = self.next_subscription_id;
         self.next_subscription_id =
@@ -354,7 +342,7 @@ impl Controller {
     pub async fn bootstrap(&self, bootstrap_addr: SocketAddr) -> io::Result<()> {
         tracing::info!(?bootstrap_addr, "bootstrapping");
 
-        let mut framed = self.connect(bootstrap_addr).await?;
+        let mut framed = self.connect_socket(bootstrap_addr).await?;
 
         let self_addr = self.config.addrs.dht_addr;
         let subscription = self
@@ -365,6 +353,7 @@ impl Controller {
 
         self.send_packet_request(&mut framed, self_addr, Payload::NeighborsRequest)
             .await?;
+        self.disconnect(framed).await?;
 
         let response_packet = subscription.recv().await?; // <- TODO: timeout
         let Payload::NeighborsResponse(neighbors) = response_packet.payload else {
@@ -379,7 +368,31 @@ impl Controller {
             self.query_add_link(succ).await?;
         }
 
+        Ok(())
+    }
+
+    /// Pings a [`DhtAddr`].
+    #[tracing::instrument(skip_all)]
+    pub async fn ping(&self, dst_addr: DhtAddr) -> io::Result<()> {
+        tracing::info!(?dst_addr, "pinging");
+
+        let links = self.query_get_links().await?;
+        let mut framed = self.connect_dht(dst_addr, &links).await?;
+
+        let ping_data = rand::thread_rng().gen();
+
+        let subscription = self
+            .query_subscribe(dst_addr, move |payload| {
+                *payload == Payload::Pong(ping_data)
+            })
+            .await?;
+
+        self.send_packet_request(&mut framed, dst_addr, Payload::Ping(ping_data))
+            .await?;
         self.disconnect(framed).await?;
+
+        let response_packet = subscription.recv().await?; // <- TODO: timeout
+        debug_assert_eq!(response_packet.payload, Payload::Pong(ping_data));
 
         Ok(())
     }
@@ -414,7 +427,7 @@ impl Controller {
             .await
     }
 
-    async fn query_notify_subscribers(&self, packet: Packet) -> Response<()> {
+    async fn query_notify_subscribers(&self, packet: Packet) -> Response<bool> {
         self.send_query(|response| Query::NotifySubscribers(response, packet))
             .await
     }
@@ -422,7 +435,7 @@ impl Controller {
     async fn query_subscribe(
         &self,
         src_addr: DhtAddr,
-        predicate: impl 'static + FnMut(&Payload) -> bool,
+        predicate: impl FnMut(&Payload) -> bool + Send + 'static,
     ) -> Response<Subscription> {
         let (id, receiver) = self
             .send_query(|response| Query::Subscribe(response, src_addr, Box::new(predicate)))
@@ -451,11 +464,22 @@ impl Controller {
         response_receiver.await.map_err(|_| ConnectionClosed(()))
     }
 
-    async fn connect(&self, socket_addr: SocketAddr) -> io::Result<FramedStream> {
+    async fn connect_socket(&self, socket_addr: SocketAddr) -> io::Result<FramedStream> {
         let stream = TcpStream::connect(socket_addr).await?;
         tracing::debug!(?socket_addr, "outbound connection established");
         let codec = Codec::new(self.config.max_packet_length);
         Ok(Framed::new(stream, codec))
+    }
+
+    async fn connect_dht(&self, dst_addr: DhtAddr, links: &Links) -> io::Result<FramedStream> {
+        // TODO: Handle case where peer is not reachable. Also timeout.
+        let index = Fingers::index_of(self.config.addrs.dht_addr, dst_addr);
+        let Some(finger_addrs) = links.successors.get(index) else {
+            tracing::error!("packet doesn't target self and we don't have fingers");
+            return Err(NoRoute(()).into());
+        };
+        tracing::trace!(index, ?finger_addrs, "connecting to finger");
+        self.connect_socket(finger_addrs.socket_addr).await
     }
 
     async fn disconnect(&self, mut framed: FramedStream) -> io::Result<()> {
@@ -615,44 +639,42 @@ impl RemotePeerGuard {
         mut packet: Packet,
     ) -> io::Result<()> {
         tracing::debug!(?packet, "received packet");
-        let mut old_links = None;
-        let mut links = self.controller.query_get_links().await?;
-        self.controller
+        let links = self.controller.query_get_links().await?;
+        let notified = self
+            .controller
             .query_notify_subscribers(packet.clone())
             .await?;
 
         let self_dht_addr = self.controller.config.addrs.dht_addr;
+        let packet_src = packet.src;
 
         // If we don't have a predecessor, assume the packet targets self for now.
         let targets_self = links.predecessor.map_or(true, |pred| {
             Self::packet_targets_self(self_dht_addr, pred.dht_addr, packet.dst)
         });
 
-        // TODO: check if we already have this link and if we don't then ping the peer before adding.
-        // Note that the bootstrapping response has src and dst set to `self_dht_addr`.
-        if packet.src.dht_addr != self_dht_addr {
-            self.controller.query_add_link(packet.src).await?;
-            old_links = Some(links);
-            links = self.controller.query_get_links().await?;
-        }
-
         if targets_self {
-            return self
-                .process_self_packet(packet, &links, old_links.as_ref())
-                .await;
-        }
-
-        if packet.ttl == 0 {
+            self.process_self_packet(packet, &links, notified).await?;
+        } else if packet.ttl == 0 {
             tracing::debug!("packet reached end of TTL, discarding it");
-            return Ok(());
-        }
-        packet.ttl -= 1;
+        } else {
+            packet.ttl -= 1;
 
-        // Packet doesn't target self, forward it.
-        let mut finger_framed = self.connect_finger(packet.dst, &links).await?;
-        tracing::debug!("forwarding packet");
-        finger_framed.send(packet).await?;
-        self.controller.disconnect(finger_framed).await?;
+            // Packet doesn't target self, forward it.
+            let mut finger_framed = self.controller.connect_dht(packet.dst, &links).await?;
+            tracing::debug!("forwarding packet");
+            finger_framed.send(packet).await?;
+            self.controller.disconnect(finger_framed).await?;
+        }
+
+        // Note that updating links has to happen after all processing lest we route the bootstrap
+        // request right back to its source.
+        // Also note that the bootstrapping response has src and dst set to `self_dht_addr`.
+        // TODO: Check if we already have this link and if we don't then ping the peer before adding.
+        if packet_src.dht_addr != self_dht_addr {
+            self.controller.query_add_link(packet_src).await?;
+            self.controller.query_get_links().await?;
+        }
 
         Ok(())
     }
@@ -661,55 +683,64 @@ impl RemotePeerGuard {
         &self,
         packet: Packet,
         links: &Links,
-        old_links: Option<&Links>,
+        notified: bool,
     ) -> io::Result<()> {
         tracing::debug!("packet targets self");
 
         match packet.payload {
             Payload::Ping(n) => {
-                let mut finger_framed = self.connect_finger(packet.src.dht_addr, links).await?;
+                let mut dst_framed = self.connect_for_response(&packet, links).await?;
                 self.controller
-                    .send_packet_response(&mut finger_framed, &packet, Payload::Pong(n))
+                    .send_packet_response(&mut dst_framed, &packet, Payload::Pong(n))
                     .await?;
-                self.controller.disconnect(finger_framed).await?;
+                self.controller.disconnect(dst_framed).await?;
                 Ok(())
             }
             Payload::NeighborsRequest => {
-                let mut finger_framed = self.connect_finger(packet.src.dht_addr, links).await?;
+                let mut dst_framed = self.connect_for_response(&packet, links).await?;
 
                 let neighbors = Neighbors {
-                    pred: old_links.unwrap_or(links).predecessor,
+                    pred: links.predecessor,
                     succ: Some(self.controller.config.addrs),
                 };
 
                 self.controller
                     .send_packet_response(
-                        &mut finger_framed,
+                        &mut dst_framed,
                         &packet,
                         Payload::NeighborsResponse(neighbors),
                     )
                     .await?;
 
-                self.controller.disconnect(finger_framed).await?;
+                self.controller.disconnect(dst_framed).await?;
 
                 Ok(())
             }
             _ => {
-                tracing::error!(kind = ?packet.payload.kind(), "unexpected inbound packet");
-                Err(io::ErrorKind::InvalidData.into())
+                if notified {
+                    // A subscriber handled this packet.
+                    Ok(())
+                } else {
+                    tracing::error!(?packet, "unexpected inbound packet");
+                    Err(io::ErrorKind::InvalidData.into())
+                }
             }
         }
     }
 
-    async fn connect_finger(&self, dst_addr: DhtAddr, links: &Links) -> io::Result<FramedStream> {
-        // TODO: Handle case where peer is not reachable. Also timeout.
-        let index = Fingers::index_of(self.controller.config.addrs.dht_addr, dst_addr);
-        let Some(finger_addrs) = links.successors.get(index) else {
-            tracing::error!("packet doesn't target self and we don't have fingers");
-            return Err(NoRoute(()).into());
-        };
-        tracing::trace!(index, ?finger_addrs, "connecting to finger");
-        self.controller.connect(finger_addrs.socket_addr).await
+    async fn connect_for_response(
+        &self,
+        packet: &Packet,
+        links: &Links,
+    ) -> io::Result<FramedStream> {
+        if packet.src.dht_addr == packet.dst {
+            // Special case for bootstrapping.
+            self.controller.connect_socket(packet.src.socket_addr).await
+        } else {
+            self.controller
+                .connect_dht(packet.src.dht_addr, links)
+                .await
+        }
     }
 
     fn packet_targets_self(self_addr: DhtAddr, pred_addr: DhtAddr, dst_addr: DhtAddr) -> bool {
@@ -744,11 +775,11 @@ enum Query {
     GetLinks(oneshot::Sender<Links>),
     AddLink(oneshot::Sender<()>, DhtAndSocketAddr),
     RemoveLink(oneshot::Sender<()>, DhtAddr),
-    NotifySubscribers(oneshot::Sender<()>, Packet),
+    NotifySubscribers(oneshot::Sender<bool>, Packet),
     Subscribe(
         oneshot::Sender<(SubscriptionId, oneshot::Receiver<Packet>)>,
         DhtAddr,
-        Box<dyn FnMut(&Payload) -> bool>,
+        Box<dyn FnMut(&Payload) -> bool + Send>,
     ),
 }
 
@@ -774,6 +805,7 @@ enum Event {
     Unsubscribe(SubscriptionId),
 }
 
+/// "receive" half of a subscription
 #[derive(Debug)]
 struct Subscription {
     _guard: SubscriptionGuard,
@@ -806,6 +838,22 @@ impl Subscription {
 
     async fn recv(self) -> Response<Packet> {
         self.receiver.await.map_err(|_| ConnectionClosed(()))
+    }
+}
+
+/// "send" half of a subscription
+struct SubscriptionData {
+    response: oneshot::Sender<Packet>,
+    src_addr: DhtAddr,
+    predicate: Box<dyn FnMut(&Payload) -> bool + Send>,
+}
+
+impl fmt::Debug for SubscriptionData {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SubscriptionData")
+            .field("response", &self.response)
+            .field("src_addr", &self.src_addr)
+            .finish_non_exhaustive()
     }
 }
 
