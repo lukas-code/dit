@@ -1,3 +1,4 @@
+use rand::seq::IteratorRandom;
 use rand::Rng;
 use tokio::time::Duration;
 
@@ -140,6 +141,55 @@ async fn ping_many_random() {
     for _ in 0..16 {
         for con in controllers.iter() {
             con.ping(DhtAddr::random()).await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn announce_fetch() {
+    install_tracing_subscriber();
+
+    let mut controllers = Vec::<Controller>::new();
+
+    for _ in 0..64 {
+        let config = get_config(DhtAddr::random());
+        let rt = Runtime::new(config).await.unwrap();
+        tokio::spawn(async move {
+            while let Some(peer) = rt.listener.accept().await.unwrap() {
+                tokio::spawn(peer.run());
+            }
+        });
+        tokio::spawn(rt.local_peer.run());
+
+        if !controllers.is_empty() {
+            let index = rand::thread_rng().gen_range(0..controllers.len());
+            rt.controller
+                .bootstrap(controllers[index].config().addrs.socket_addr)
+                .await
+                .unwrap();
+        }
+
+        controllers.push(rt.controller);
+    }
+
+    for _ in 0..16 {
+        let dht_addr = DhtAddr::random();
+        let mut sock_addrs = Vec::new();
+        let cons = controllers
+            .iter()
+            .choose_multiple(&mut rand::thread_rng(), 4);
+        for con in cons {
+            con.announce(dht_addr).await.unwrap();
+            sock_addrs.push(con.config().addrs.socket_addr);
+
+            let fetched = controllers
+                .iter()
+                .choose(&mut rand::thread_rng())
+                .unwrap()
+                .fetch(dht_addr)
+                .await
+                .unwrap();
+            assert_eq!(fetched, sock_addrs);
         }
     }
 }

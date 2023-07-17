@@ -18,11 +18,11 @@ pub enum Payload {
     NeighborsRequest,
     NeighborsResponse(Neighbors),
 
-    /// Append the `SocketAddr` to the DHT entry at `dst`.
-    PutRequest(SocketAddr),
+    /// Append the `src.socket_addr` to the DHT entry at `dst`.
+    PutRequest,
 
-    /// Indicates a successful put of the `SocketAddr` at `src.dht_addr`.
-    PutResponse(SocketAddr),
+    /// Indicates a successful put at `src.dht_addr`.
+    PutResponse,
 
     /// Requests the DHT entry at `dst`.
     GetRequest,
