@@ -15,6 +15,7 @@ use rand::Rng;
 use std::collections::hash_map::{Entry, HashMap};
 use std::error::Error;
 use std::fmt;
+use std::io::{Read, Write};
 use std::sync::Arc;
 use tokio::io;
 use tokio::net::{TcpListener, TcpStream};
@@ -25,6 +26,7 @@ use tokio_util::codec::Framed;
 pub use self::types::{DhtAddr, DhtAndSocketAddr};
 
 type FramedStream = Framed<TcpStream, Codec<Packet>>;
+type Opener = Box<dyn Fn(DhtAddr) -> Option<Box<dyn Read + Send>> + Send + Sync>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerConfig {
@@ -43,7 +45,25 @@ pub struct Runtime {
 }
 
 impl Runtime {
-    pub async fn new(mut config: PeerConfig) -> io::Result<Self> {
+    pub async fn new(config: PeerConfig) -> io::Result<Self> {
+        Self::new_internal(config, None).await
+    }
+
+    pub async fn with_opener<F, R>(config: PeerConfig, opener: F) -> io::Result<Self>
+    where
+        F: Fn(DhtAddr) -> Option<R> + Send + Sync + 'static,
+        R: Read + Send + 'static,
+    {
+        Self::new_internal(
+            config,
+            Some(Box::new(move |addr| {
+                opener(addr).map(|reader| Box::new(reader) as _)
+            })),
+        )
+        .await
+    }
+
+    async fn new_internal(mut config: PeerConfig, opener: Option<Opener>) -> io::Result<Self> {
         assert!(
             !config.addrs.socket_addr.ip().is_unspecified(),
             "listener address must be specified",
@@ -57,10 +77,10 @@ impl Runtime {
         let (event_sender, event_receiver) = mpsc::unbounded_channel();
         let (shutdown_sender, shutdown_receiver) = watch::channel(false);
 
-        let config = Arc::new(config);
+        let shared = Arc::new(SharedData { config, opener });
 
         let controller = Controller {
-            config: config.clone(),
+            shared: shared.clone(),
             query_sender,
             event_sender,
             shutdown_receiver,
@@ -72,7 +92,7 @@ impl Runtime {
         };
 
         let local_peer = LocalPeer {
-            config,
+            shared,
             query_receiver,
             event_receiver,
             shutdown_sender,
@@ -106,9 +126,22 @@ struct Links {
     successors: Fingers,
 }
 
+struct SharedData {
+    config: PeerConfig,
+    opener: Option<Opener>,
+}
+
+impl fmt::Debug for SharedData {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SharedData")
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug)]
 pub struct LocalPeer {
-    config: Arc<PeerConfig>,
+    shared: Arc<SharedData>,
     query_receiver: mpsc::Receiver<Query>,
     event_receiver: mpsc::UnboundedReceiver<Event>,
     shutdown_sender: watch::Sender<bool>,
@@ -124,7 +157,7 @@ pub struct LocalPeer {
 impl LocalPeer {
     #[tracing::instrument(name = "run_local", skip(self))]
     pub async fn run(mut self) {
-        tracing::debug!(?self.config, "starting local peer");
+        tracing::debug!(?self.shared.config, "starting local peer");
         loop {
             tokio::select! {
                 event = self.event_receiver.recv() => {
@@ -199,7 +232,7 @@ impl LocalPeer {
     }
 
     fn process_add_link(&mut self, new: DhtAndSocketAddr) {
-        let self_dht_addr = self.config.addrs.dht_addr;
+        let self_dht_addr = self.shared.config.addrs.dht_addr;
 
         if !self.links.predecessor.is_some_and(|old| {
             self_dht_addr.wrapping_sub(old.dht_addr) <= self_dht_addr.wrapping_sub(new.dht_addr)
@@ -211,7 +244,7 @@ impl LocalPeer {
         if let Some(old) = self
             .links
             .successors
-            .insert(self.config.addrs.dht_addr, new)
+            .insert(self.shared.config.addrs.dht_addr, new)
         {
             tracing::debug!(?old, ?new, "updating successor");
         }
@@ -229,7 +262,7 @@ impl LocalPeer {
         if let Some(old) = self
             .links
             .successors
-            .remove(self.config.addrs.dht_addr, dht_addr)
+            .remove(self.shared.config.addrs.dht_addr, dht_addr)
         {
             tracing::debug!(?old, "removing successor");
         }
@@ -331,7 +364,7 @@ impl LocalPeer {
 
 #[derive(Debug, Clone)]
 pub struct Controller {
-    config: Arc<PeerConfig>,
+    shared: Arc<SharedData>,
     query_sender: mpsc::Sender<Query>,
     event_sender: mpsc::UnboundedSender<Event>,
     shutdown_receiver: watch::Receiver<bool>,
@@ -339,7 +372,7 @@ pub struct Controller {
 
 impl Controller {
     pub fn config(&self) -> &PeerConfig {
-        &self.config
+        &self.shared.config
     }
 
     /// Completes when the connection to the [`LocalPeer`] has been closed.
@@ -369,13 +402,13 @@ impl Controller {
     #[tracing::instrument(skip_all)]
     pub async fn bootstrap(&self, bootstrap_addr: SocketAddr) -> io::Result<()> {
         // TODO: This isn't supported for now, but should probably just be a no-op.
-        assert_ne!(bootstrap_addr, self.config.addrs.socket_addr);
+        assert_ne!(bootstrap_addr, self.config().addrs.socket_addr);
 
         tracing::info!(?bootstrap_addr, "bootstrapping");
 
         let mut framed = self.connect_socket(bootstrap_addr).await?;
 
-        let self_addr = self.config.addrs.dht_addr;
+        let self_addr = self.config().addrs.dht_addr;
         let subscription = self
             .query_subscribe(self_addr, |payload| {
                 payload.kind() == DhtPayloadKind::NeighborsResponse
@@ -504,6 +537,15 @@ impl Controller {
         Ok(addrs)
     }
 
+    /// Receives a file via a socket-bound connection and writes it to the writer.
+    pub fn recv_file(
+        &self,
+        file_addrs: DhtAndSocketAddr,
+        writer: &mut dyn Write,
+    ) -> io::Result<()> {
+        todo!()
+    }
+
     async fn query_remote_connect(&self, socket_addr: SocketAddr) -> Response<ConnectionId> {
         self.send_query(|response| Query::RemoteConnect(response, socket_addr))
             .await
@@ -515,7 +557,7 @@ impl Controller {
     }
 
     async fn query_add_link(&self, addrs: DhtAndSocketAddr) -> Response<()> {
-        assert_ne!(addrs.dht_addr, self.config.addrs.dht_addr);
+        assert_ne!(addrs.dht_addr, self.config().addrs.dht_addr);
 
         self.send_query(|response| Query::AddLink(response, addrs))
             .await
@@ -523,7 +565,7 @@ impl Controller {
 
     #[allow(dead_code)] // TODO: use this
     async fn query_remove_link(&self, dht_addr: DhtAddr) -> Response<()> {
-        assert_ne!(dht_addr, self.config.addrs.dht_addr);
+        assert_ne!(dht_addr, self.config().addrs.dht_addr);
 
         self.send_query(|response| Query::RemoveLink(response, dht_addr))
             .await
@@ -578,23 +620,23 @@ impl Controller {
 
     async fn connect_socket(&self, socket_addr: SocketAddr) -> io::Result<FramedStream> {
         let stream_future = TcpStream::connect(socket_addr);
-        let stream = time::timeout(self.config.connect_timeout, stream_future).await??;
+        let stream = time::timeout(self.config().connect_timeout, stream_future).await??;
         tracing::debug!(?socket_addr, "outbound connection established");
-        let codec = Codec::new(self.config.max_packet_length);
+        let codec = Codec::new(self.config().max_packet_length);
         Ok(Framed::new(stream, codec))
     }
 
     async fn connect_dht(&self, dst_addr: DhtAddr, links: &Links) -> io::Result<FramedStream> {
         // Special case for loopback connections, for example for pinging own address.
-        if dst_addr == self.config.addrs.dht_addr {
+        if dst_addr == self.config().addrs.dht_addr {
             tracing::trace!("creating loopback connection");
-            return self.connect_socket(self.config.addrs.socket_addr).await;
+            return self.connect_socket(self.config().addrs.socket_addr).await;
         }
 
         // TODO: Handle case where peer is not reachable / connection times out.
         let Some(finger_addrs) = links
             .successors
-            .get_route(self.config.addrs.dht_addr, dst_addr)
+            .get_route(self.config().addrs.dht_addr, dst_addr)
         else {
             tracing::error!("packet doesn't target self and we don't have fingers");
             return Err(NoRoute(()).into());
@@ -624,9 +666,9 @@ impl Controller {
         payload: DhtPayload,
     ) -> io::Result<()> {
         let packet = Packet::Dht(DhtPacket {
-            src: self.config.addrs,
+            src: self.config().addrs,
             dst,
-            ttl: self.config.ttl,
+            ttl: self.config().ttl,
             payload,
         });
         tracing::trace!(?packet, socket_addr = ?framed.get_ref().peer_addr(), "sending packet (request)");
@@ -642,10 +684,10 @@ impl Controller {
         let packet = Packet::Dht(DhtPacket {
             src: DhtAndSocketAddr {
                 dht_addr: request.dst,
-                socket_addr: self.config.addrs.socket_addr,
+                socket_addr: self.config().addrs.socket_addr,
             },
             dst: request.src.dht_addr,
-            ttl: self.config.ttl,
+            ttl: self.config().ttl,
             payload,
         });
         tracing::trace!(?packet, socket_addr = ?framed.get_ref().peer_addr(), "sending packet (response)");
@@ -771,7 +813,7 @@ impl RemotePeer {
     #[tracing::instrument(name = "run_remote", skip(self), fields(self.id))]
     pub async fn run(self) -> io::Result<()> {
         tracing::debug!("starting remote peer");
-        let codec = Codec::new(self.guard.controller.config.max_packet_length);
+        let codec = Codec::new(self.guard.controller.config().max_packet_length);
         let mut framed = Framed::new(self.stream, codec);
         loop {
             tokio::select! {
@@ -811,7 +853,7 @@ impl RemotePeerGuard {
             .query_notify_subscribers(packet.clone())
             .await?;
 
-        let self_addrs = self.controller.config.addrs;
+        let self_addrs = self.controller.config().addrs;
         let packet_src = packet.src;
 
         // If we don't have a predecessor, assume the packet targets self for now.
@@ -878,7 +920,7 @@ impl RemotePeerGuard {
 
                 let neighbors = Neighbors {
                     pred: old_links.predecessor,
-                    succ: Some(self.controller.config.addrs),
+                    succ: Some(self.controller.config().addrs),
                 };
 
                 self.controller
@@ -1065,9 +1107,12 @@ impl Subscription {
     }
 
     async fn recv(self) -> io::Result<DhtPacket> {
-        time::timeout(self.guard.controller.config.response_timeout, self.receiver)
-            .await?
-            .map_err(|_| ConnectionClosed(()).into())
+        time::timeout(
+            self.guard.controller.config().response_timeout,
+            self.receiver,
+        )
+        .await?
+        .map_err(|_| ConnectionClosed(()).into())
     }
 }
 
