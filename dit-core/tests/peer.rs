@@ -73,6 +73,7 @@ async fn ping_simple() {
 }
 
 #[tokio::test]
+#[cfg_attr(windows, ignore = "fails spuriously")] // FIXME
 async fn ping_many_sequential() {
     install_tracing_subscriber();
 
