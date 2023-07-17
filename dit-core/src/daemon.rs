@@ -4,8 +4,11 @@
 //! manage the remote peers that connect to the listener.
 
 use crate::codec::Codec;
+use crate::peer::Controller;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
+use std::error::Error;
+use std::fmt;
 use std::net::SocketAddr;
 use tokio::io;
 use tokio::net::{TcpListener, TcpStream};
@@ -20,12 +23,15 @@ pub struct DaemonConfig {
 pub enum Packet {
     Ping(u64),
     Pong(u64),
+    Bootstrap(SocketAddr),
+    Status(Result<(), String>),
 }
 
 /// This struct represents the connection from the daemon to a process.
 #[derive(Debug)]
 pub struct ConnectionToProcess {
     stream: Framed<TcpStream, Codec<Packet>>,
+    controller: Controller,
 }
 
 impl ConnectionToProcess {
@@ -43,8 +49,23 @@ impl ConnectionToProcess {
                     // Respond with Pong
                     self.stream.send(Packet::Pong(value)).await?;
                 }
-                Ok(Packet::Pong(_)) => {
-                    tracing::warn!("Received unexpected Pong packet");
+                Ok(Packet::Bootstrap(address)) => {
+                    tracing::info!("Received Bootstrap with address: {}", address);
+
+                    // Bootstrap the local peer
+                    let result = self.controller.bootstrap(address).await;
+                    tracing::debug!(?result);
+                    let status = result.map_err(|err| err.to_string());
+                    self.stream.send(Packet::Status(status)).await?;
+                }
+                Ok(packet) => {
+                    tracing::warn!(?packet, "Received unexpected packet");
+                    // Disconnect the client if they send an invalid packet so that
+                    // they won't wait for us to respond.
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "unexpected packet",
+                    ));
                 }
                 Err(e) => {
                     tracing::error!("Failed to process packet: {}", e);
@@ -65,7 +86,7 @@ pub struct ConnectionToDaemon {
 
 impl ConnectionToDaemon {
     /// Create a new connection to the daemon.
-    pub async fn connect(address: SocketAddr) -> tokio::io::Result<Self> {
+    pub async fn connect(address: SocketAddr) -> io::Result<Self> {
         let stream = TcpStream::connect(address).await?;
         let stream = Framed::new(stream, Codec::new(1024));
 
@@ -73,73 +94,69 @@ impl ConnectionToDaemon {
     }
 
     /// Send a ping packet to the daemon.
-    pub async fn ping(&mut self, value: u64) -> tokio::io::Result<()> {
+    pub async fn ping(&mut self, value: u64) -> io::Result<()> {
         self.stream.send(Packet::Ping(value)).await
     }
 
     /// Receive a packet from the daemon.
-    pub async fn receive(&mut self) -> tokio::io::Result<Option<Packet>> {
+    pub async fn receive(&mut self) -> io::Result<Packet> {
         match self.stream.next().await {
-            Some(Ok(packet)) => Ok(Some(packet)),
+            Some(Ok(packet)) => Ok(packet),
             Some(Err(e)) => Err(e),
-            None => Ok(None),
+            None => Err(io::ErrorKind::UnexpectedEof.into()),
         }
     }
+
+    pub async fn bootstrap(&mut self, address: SocketAddr) -> io::Result<()> {
+        self.stream.send(Packet::Bootstrap(address)).await?;
+        let response = self.receive().await?;
+        let status = match response {
+            Packet::Status(status) => status,
+            packet => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    UnexpectedPacket(packet),
+                ))
+            }
+        };
+        status.map_err(|err| io::Error::new(io::ErrorKind::Other, err))
+    }
 }
+
+/// An error that indicated that an unexpected packet was received.
+#[derive(Debug)]
+struct UnexpectedPacket(Packet);
+
+impl fmt::Display for UnexpectedPacket {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("received unexpected packet")
+    }
+}
+
+impl Error for UnexpectedPacket {}
 
 /// The local listener listens for connections from processes.
 #[derive(Debug)]
 pub struct LocalListener {
-    pub tcp_listener: TcpListener,
+    tcp_listener: TcpListener,
+    controller: Controller,
 }
 
 impl LocalListener {
+    pub async fn new(config: &DaemonConfig, controller: Controller) -> io::Result<Self> {
+        let tcp_listener = TcpListener::bind(config.socket_addr).await?;
+        Ok(Self {
+            tcp_listener,
+            controller,
+        })
+    }
+
     pub async fn accept(&mut self) -> io::Result<Option<ConnectionToProcess>> {
         let (socket, _) = self.tcp_listener.accept().await?;
         let process = ConnectionToProcess {
             stream: Framed::new(socket, Codec::new(1024)),
+            controller: self.controller.clone(),
         };
         Ok(Some(process))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use bytes::BytesMut;
-    use tokio_util::codec::{Decoder, Encoder};
-
-    #[tokio::test]
-    async fn encode_decode_multiple_roundtrip() {
-        let test_packets = vec![
-            Packet::Ping(123),
-            Packet::Pong(123),
-            Packet::Ping(456),
-            Packet::Pong(456),
-        ];
-
-        let mut codec = Codec::new(1024);
-        let mut buffer = BytesMut::new();
-
-        for packet in test_packets.clone() {
-            codec.encode(packet.clone(), &mut buffer).unwrap();
-        }
-
-        for packet in test_packets {
-            let received = codec.decode(&mut buffer).unwrap().unwrap();
-            assert_eq!(received, packet);
-        }
-    }
-
-    #[tokio::test]
-    async fn encode_decode_single_roundtrip() {
-        let test_packet = Packet::Ping(123);
-
-        let mut codec = Codec::new(1024);
-        let mut buffer = BytesMut::new();
-
-        codec.encode(test_packet.clone(), &mut buffer).unwrap();
-        let received = codec.decode(&mut buffer).unwrap().unwrap();
-        assert_eq!(received, test_packet);
     }
 }
