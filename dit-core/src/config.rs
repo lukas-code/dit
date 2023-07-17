@@ -7,6 +7,7 @@ use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::{fmt, io};
+use tokio::time::Duration;
 
 mod file {
     use crate::peer::DhtAddr;
@@ -28,6 +29,8 @@ mod file {
         pub listener: Option<SocketAddr>,
         pub dht_addr: Option<DhtAddr>,
         pub ttl: Option<u32>,
+        pub connect_timeout: Option<u64>,
+        pub response_timeout: Option<u64>,
         pub max_packet_length: Option<u32>,
     }
 
@@ -103,6 +106,10 @@ impl GlobalConfig {
                     socket_addr: peer_socket_addr,
                 },
                 ttl: parsed.peer.ttl.unwrap_or(16),
+                connect_timeout: Duration::from_millis(parsed.peer.connect_timeout.unwrap_or(1000)),
+                response_timeout: Duration::from_millis(
+                    parsed.peer.response_timeout.unwrap_or(1000),
+                ),
                 max_packet_length: parsed.peer.max_packet_length.unwrap_or(1024),
             },
             daemon: DaemonConfig {
@@ -205,16 +212,16 @@ mod tests {
     fn unknown_field() {
         assert_error(
             multiline_str!(
+                ///unknown = true
                 ///[peer]
                 ///listener = "1.2.3.4:5"
-                ///no = true
             ),
             multiline_str!(
-                ///TOML parse error at line 3, column 1
+                ///TOML parse error at line 1, column 1
                 ///  |
-                ///3 | no = true
-                ///  | ^^
-                ///unknown field `no`, expected one of `listener`, `dht_addr`, `ttl`, `max_packet_length`
+                ///1 | unknown = true
+                ///  | ^^^^^^^
+                ///unknown field `unknown`, expected one of `peer`, `daemon`, `store`
             ),
         )
     }
