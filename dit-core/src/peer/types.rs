@@ -87,14 +87,6 @@ impl DhtAddr {
         }
         self
     }
-
-    pub fn wrapping_distance(self, other: Self) -> Self {
-        if self >= other {
-            self.wrapping_sub(other)
-        } else {
-            other.wrapping_sub(self)
-        }
-    }
 }
 
 impl fmt::Display for DhtAddr {
@@ -248,11 +240,11 @@ impl Fingers {
         }
     }
 
-    /// Inserts a new finger at the index, returning the previous finger.
+    /// Inserts a new finger at the index, overwriting the previous finger.
     #[track_caller]
-    pub fn insert(&mut self, index: usize, addrs: DhtAndSocketAddr) -> Option<DhtAndSocketAddr> {
+    pub fn insert(&mut self, index: usize, addrs: DhtAndSocketAddr) {
         assert!(index < DhtAddr::BITS, "Fingers: index out of bounds");
-        self.map.insert(index, addrs)
+        self.map.insert(index, addrs);
     }
 
     /// Removes the finger at the index, returning it.
@@ -262,7 +254,7 @@ impl Fingers {
         self.map.remove(&index)
     }
 
-    /// Returns a finger at the index or below.
+    /// Returns the finger at the index or below.
     #[track_caller]
     pub fn get(&self, index: usize) -> Option<&DhtAndSocketAddr> {
         assert!(index < DhtAddr::BITS, "Fingers: index out of bounds");
@@ -273,6 +265,13 @@ impl Fingers {
             .next_back()
             .or_else(|| self.map.first_key_value())
             .map(|(_, addrs)| addrs)
+    }
+
+    /// Returns the finger exactly at the index.
+    #[track_caller]
+    pub fn get_exact(&self, index: usize) -> Option<&DhtAndSocketAddr> {
+        assert!(index < DhtAddr::BITS, "Fingers: index out of bounds");
+        self.map.get(&index)
     }
 }
 

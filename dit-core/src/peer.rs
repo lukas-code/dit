@@ -186,21 +186,25 @@ impl LocalPeer {
     }
 
     fn process_add_link(&mut self, new: DhtAndSocketAddr) {
-        let keep_old = |old: DhtAndSocketAddr| {
-            self.config.addrs.dht_addr.wrapping_distance(old.dht_addr)
-                <= self.config.addrs.dht_addr.wrapping_distance(new.dht_addr)
-        };
+        let self_dht_addr = self.config.addrs.dht_addr;
 
-        if !self.links.predecessor.is_some_and(keep_old) {
+        if !self.links.predecessor.is_some_and(|old| {
+            self_dht_addr.wrapping_sub(old.dht_addr) <= self_dht_addr.wrapping_sub(new.dht_addr)
+        }) {
             tracing::debug!(old = ?self.links.predecessor, ?new, "updating predecessor");
             self.links.predecessor = Some(new)
         }
 
         let finger_index = Fingers::index_of(self.config.addrs.dht_addr, new.dht_addr);
-        let old = self.links.successors.insert(finger_index, new);
-        if old != Some(new) {
+        let old = self.links.successors.get_exact(finger_index);
+        if !old.is_some_and(|old| {
+            old.dht_addr.wrapping_sub(self_dht_addr) <= new.dht_addr.wrapping_sub(self_dht_addr)
+        }) {
             tracing::debug!(?old, ?new, ?finger_index, "updating successor");
+            self.links.successors.insert(finger_index, new);
         }
+
+        dbg!(self.config.addrs, &self.links);
     }
 
     fn process_remove_link(&mut self, dht_addr: DhtAddr) {

@@ -69,7 +69,6 @@ async fn ping_many() {
     let mut controllers = Vec::<Controller>::new();
 
     for n in 0..128 {
-        dbg!(n);
         let config = PeerConfig {
             addrs: DhtAndSocketAddr {
                 dht_addr: DhtAddr::random(),
@@ -93,8 +92,7 @@ async fn ping_many() {
                 .unwrap();
         }
 
-        for con in controllers.iter() {
-            dbg!();
+        for (m, con) in controllers.iter().enumerate() {
             rt.controller
                 .ping(con.config().addrs.dht_addr)
                 .await
