@@ -26,7 +26,7 @@ fn get_config(dht_addr: DhtAddr) -> PeerConfig {
 }
 
 #[tokio::test]
-async fn ping_simple() {
+async fn ping_dht_simple() {
     install_tracing_subscriber();
 
     let config = get_config(
@@ -61,11 +61,11 @@ async fn ping_simple() {
         .unwrap();
 
     rt2.controller
-        .ping(rt1.controller.config().addrs.dht_addr)
+        .ping_dht(rt1.controller.config().addrs.dht_addr)
         .await
         .unwrap();
     rt1.controller
-        .ping(rt2.controller.config().addrs.dht_addr)
+        .ping_dht(rt2.controller.config().addrs.dht_addr)
         .await
         .unwrap();
 
@@ -75,7 +75,7 @@ async fn ping_simple() {
 
 #[tokio::test]
 #[cfg_attr(windows, ignore = "fails spuriously")] // FIXME
-async fn ping_many_sequential() {
+async fn ping_dht_many_sequential() {
     install_tracing_subscriber();
 
     let mut controllers = Vec::<Controller>::new();
@@ -102,7 +102,7 @@ async fn ping_many_sequential() {
 
         for con in controllers.iter() {
             rt.controller
-                .ping(con.config().addrs.dht_addr)
+                .ping_dht(con.config().addrs.dht_addr)
                 .await
                 .unwrap();
         }
@@ -112,7 +112,7 @@ async fn ping_many_sequential() {
 }
 
 #[tokio::test]
-async fn ping_many_random() {
+async fn ping_dht_many_random() {
     install_tracing_subscriber();
 
     let mut controllers = Vec::<Controller>::new();
@@ -140,7 +140,7 @@ async fn ping_many_random() {
 
     for _ in 0..16 {
         for con in controllers.iter() {
-            con.ping(DhtAddr::random()).await.unwrap();
+            con.ping_dht(DhtAddr::random()).await.unwrap();
         }
     }
 }
@@ -192,4 +192,49 @@ async fn announce_fetch() {
             assert_eq!(fetched, sock_addrs);
         }
     }
+}
+
+#[tokio::test]
+async fn ping_socket() {
+    install_tracing_subscriber();
+
+    let config = get_config(
+        "1000000000000000000000000000000000000000000000000000000000000000"
+            .parse()
+            .unwrap(),
+    );
+    let rt1 = Runtime::new(config).await.unwrap();
+    tokio::spawn(async move {
+        while let Some(peer) = rt1.listener.accept().await.unwrap() {
+            tokio::spawn(peer.run());
+        }
+    });
+    tokio::spawn(rt1.local_peer.run());
+
+    let config = get_config(
+        "2000000000000000000000000000000000000000000000000000000000000000"
+            .parse()
+            .unwrap(),
+    );
+    let rt2 = Runtime::new(config).await.unwrap();
+    tokio::spawn(async move {
+        while let Some(peer) = rt2.listener.accept().await.unwrap() {
+            tokio::spawn(peer.run());
+        }
+    });
+    tokio::spawn(rt2.local_peer.run());
+
+    // Don't bootstrap, socket pings don't need dht access.
+
+    rt2.controller
+        .ping_socket(rt1.controller.config().addrs.socket_addr)
+        .await
+        .unwrap();
+    rt1.controller
+        .ping_socket(rt2.controller.config().addrs.socket_addr)
+        .await
+        .unwrap();
+
+    rt1.controller.shutdown().await.unwrap();
+    rt2.controller.shutdown().await.unwrap();
 }
