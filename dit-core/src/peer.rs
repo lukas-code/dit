@@ -80,6 +80,7 @@ impl Runtime {
             subscriptions_by_id: HashMap::default(),
             subscriptions_by_addr: HashMap::default(),
             links: Links::default(),
+            data: HashMap::new(),
         };
 
         Ok(Self {
@@ -115,6 +116,7 @@ pub struct LocalPeer {
     subscriptions_by_id: HashMap<SubscriptionId, SubscriptionData>,
     subscriptions_by_addr: HashMap<DhtAddr, Vec<SubscriptionId>>,
     links: Links,
+    data: HashMap<DhtAddr, Vec<SocketAddr>>,
 }
 
 impl LocalPeer {
@@ -166,6 +168,12 @@ impl LocalPeer {
                         }
                         Query::Subscribe(response, dht_addr, predicate) => {
                             let _ = response.send(self.process_subscribe(dht_addr, predicate));
+                        }
+                        Query::PutData(response, addrs) => {
+                            let _ = response.send(self.process_put_data(addrs));
+                        }
+                        Query::GetData(response, dht_addr) => {
+                            let _ = response.send(self.process_get_data(dht_addr));
                         }
                     }
                 }
@@ -306,6 +314,17 @@ impl LocalPeer {
             entry.remove();
         }
     }
+
+    fn process_put_data(&mut self, addrs: DhtAndSocketAddr) {
+        self.data
+            .entry(addrs.dht_addr)
+            .or_default()
+            .push(addrs.socket_addr);
+    }
+
+    fn process_get_data(&mut self, dht_addr: DhtAddr) -> Vec<SocketAddr> {
+        self.data.get(&dht_addr).cloned().unwrap_or_default()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -414,9 +433,50 @@ impl Controller {
         Ok(())
     }
 
-    /// Stores the [`LocalPeer`]'s [`SocketAddr`] in the DHT at [`DhtAddr`].
-    pub async fn announce(&self, _dht_addr: DhtAddr) -> io::Result<()> {
-        todo!()
+    /// Stores the [`LocalPeer`]'s [`SocketAddr`] in the DHT at the destination [`DhtAddr`].
+    pub async fn announce(&self, dst_addr: DhtAddr) -> io::Result<()> {
+        tracing::info!(?dst_addr, "announcing");
+
+        let links = self.query_get_links().await?;
+        let mut framed = self.connect_dht(dst_addr, &links).await?;
+
+        let subscription = self
+            .query_subscribe(dst_addr, |payload| *payload == Payload::PutResponse)
+            .await?;
+
+        self.send_packet_request(&mut framed, dst_addr, Payload::PutRequest)
+            .await?;
+        self.disconnect(framed).await?;
+
+        let response_packet = subscription.recv().await?;
+        debug_assert_eq!(response_packet.payload, Payload::PutResponse);
+
+        Ok(())
+    }
+
+    /// Retrieves [`SocketAddr`]s stored in the DHT at the destination [`DhtAddr`].
+    pub async fn fetch(&self, dst_addr: DhtAddr) -> io::Result<Vec<SocketAddr>> {
+        tracing::info!(?dst_addr, "fetching");
+
+        let links = self.query_get_links().await?;
+        let mut framed = self.connect_dht(dst_addr, &links).await?;
+
+        let subscription = self
+            .query_subscribe(dst_addr, |payload| {
+                payload.kind() == PayloadKind::GetResponse
+            })
+            .await?;
+
+        self.send_packet_request(&mut framed, dst_addr, Payload::GetRequest)
+            .await?;
+        self.disconnect(framed).await?;
+
+        let response_packet = subscription.recv().await?;
+        let Payload::GetResponse(addrs) = response_packet.payload else {
+            unreachable!()
+        };
+
+        Ok(addrs)
     }
 
     async fn query_remote_connect(&self, socket_addr: SocketAddr) -> Response<ConnectionId> {
@@ -458,6 +518,16 @@ impl Controller {
             .send_query(|response| Query::Subscribe(response, src_addr, Box::new(predicate)))
             .await?;
         Ok(Subscription::new(self.clone(), id, receiver))
+    }
+
+    async fn query_put_data(&self, addrs: DhtAndSocketAddr) -> Response<()> {
+        self.send_query(|response| Query::PutData(response, addrs))
+            .await
+    }
+
+    async fn query_get_data(&self, dht_addr: DhtAddr) -> Response<Vec<SocketAddr>> {
+        self.send_query(|response| Query::GetData(response, dht_addr))
+            .await
     }
 
     fn send_event(&self, event: Event) -> Response<()> {
@@ -753,6 +823,31 @@ impl RemotePeerGuard {
 
                 Ok(())
             }
+            Payload::PutRequest => {
+                self.controller
+                    .query_put_data(DhtAndSocketAddr {
+                        dht_addr: packet.dst,
+                        socket_addr: packet.src.socket_addr,
+                    })
+                    .await?;
+
+                let mut dst_framed = self.connect_for_response(&packet, new_links).await?;
+                self.controller
+                    .send_packet_response(&mut dst_framed, &packet, Payload::PutResponse)
+                    .await?;
+                self.controller.disconnect(dst_framed).await?;
+                Ok(())
+            }
+            Payload::GetRequest => {
+                let data = self.controller.query_get_data(packet.dst).await?;
+
+                let mut dst_framed = self.connect_for_response(&packet, new_links).await?;
+                self.controller
+                    .send_packet_response(&mut dst_framed, &packet, Payload::GetResponse(data))
+                    .await?;
+                self.controller.disconnect(dst_framed).await?;
+                Ok(())
+            }
             _ => {
                 if notified {
                     // A subscriber handled this packet.
@@ -818,6 +913,8 @@ enum Query {
         DhtAddr,
         Box<dyn FnMut(&Payload) -> bool + Send>,
     ),
+    PutData(oneshot::Sender<()>, DhtAndSocketAddr),
+    GetData(oneshot::Sender<Vec<SocketAddr>>, DhtAddr),
 }
 
 impl fmt::Debug for Query {
@@ -831,6 +928,8 @@ impl fmt::Debug for Query {
                 f.debug_tuple("NotifySubscribers").field(arg1).finish()
             }
             Self::Subscribe(_, arg1, _) => f.debug_tuple("Subscribe").field(arg1).finish(),
+            Self::PutData(_, arg1) => f.debug_tuple("PutData").field(arg1).finish(),
+            Self::GetData(_, arg1) => f.debug_tuple("GetData").field(arg1).finish(),
         }
     }
 }
