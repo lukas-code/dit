@@ -1,4 +1,5 @@
-use std::io::{Cursor, ErrorKind};
+use std::collections::HashMap;
+use std::io::{Cursor, ErrorKind, Seek};
 
 use rand::seq::IteratorRandom;
 use rand::Rng;
@@ -245,10 +246,20 @@ async fn ping_socket() {
 async fn file_transfer() {
     install_tracing_subscriber();
 
-    let content = b"very important data";
-    let content_addr = DhtAddr::hash(content);
+    let mut mini_store = HashMap::new();
+    let mut add_to_store = |content| {
+        assert_eq!(mini_store.insert(DhtAddr::hash(&content), content), None);
+    };
+    add_to_store(Vec::new());
+    add_to_store(Vec::from(*b"very important data"));
+    add_to_store(vec![123; 45678]);
 
-    let opener = move |addr| (addr == content_addr).then(|| Cursor::new(content));
+    let cloned_store = mini_store.clone();
+    let opener = move |addr| {
+        cloned_store
+            .get(&addr)
+            .map(|content| Cursor::new(content.clone()))
+    };
 
     let config = get_config(
         "1000000000000000000000000000000000000000000000000000000000000000"
@@ -276,17 +287,22 @@ async fn file_transfer() {
     });
     tokio::spawn(rt2.local_peer.run());
 
-    // Transfer file from rt1 to rt2.
     let mut writer = Cursor::new(Vec::new());
-    let file_addrs = DhtAndSocketAddr {
-        dht_addr: content_addr,
-        socket_addr: rt1.controller.config().addrs.socket_addr,
-    };
-    rt2.controller
-        .recv_file(file_addrs, &mut writer)
-        .await
-        .unwrap();
-    assert_eq!(writer.get_ref(), content);
+
+    // Transfer files from rt1 to rt2.
+    for (addr, content) in mini_store {
+        let file_addrs = DhtAndSocketAddr {
+            dht_addr: addr,
+            socket_addr: rt1.controller.config().addrs.socket_addr,
+        };
+        rt2.controller
+            .recv_file(file_addrs, &mut writer)
+            .await
+            .unwrap();
+        assert_eq!(*writer.get_ref(), content);
+        writer.rewind().unwrap();
+        writer.get_mut().clear();
+    }
 
     // Test file not found.
     let file_addrs = DhtAndSocketAddr {
