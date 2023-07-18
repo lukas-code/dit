@@ -80,6 +80,18 @@ pub struct SocketPacket {
 pub enum SocketPayload {
     Ping(u64),
     Pong(u64),
+
+    /// Request transfer of a file by a hash of its content.
+    FileRequest(DhtAddr),
+
+    /// A chunk of a file.
+    ///
+    /// Files are transferred as a stream of consecutive parts.
+    /// An empty chunk indicates end of file.
+    FileTransfer(Vec<u8>),
+
+    /// The requested file was not found.
+    FileNotFound,
 }
 
 #[cfg(test)]

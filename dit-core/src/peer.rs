@@ -479,6 +479,8 @@ impl Controller {
         self.send_socket_packet(&mut framed, SocketPayload::Ping(ping_data))
             .await?;
         let response = self.recv_socket_packet(&mut framed).await?;
+        self.disconnect(framed).await?;
+
         match response.payload {
             SocketPayload::Pong(pong_data) if pong_data == ping_data => Ok(()),
             _ => {
@@ -492,6 +494,7 @@ impl Controller {
     }
 
     /// Stores the [`LocalPeer`]'s [`SocketAddr`] in the DHT at the destination [`DhtAddr`].
+    #[tracing::instrument(skip_all)]
     pub async fn announce(&self, dst_addr: DhtAddr) -> io::Result<()> {
         tracing::info!(?dst_addr, "announcing");
 
@@ -513,6 +516,7 @@ impl Controller {
     }
 
     /// Retrieves [`SocketAddr`]s stored in the DHT at the destination [`DhtAddr`].
+    #[tracing::instrument(skip_all)]
     pub async fn fetch(&self, dst_addr: DhtAddr) -> io::Result<Vec<SocketAddr>> {
         tracing::info!(?dst_addr, "fetching");
 
@@ -538,12 +542,48 @@ impl Controller {
     }
 
     /// Receives a file via a socket-bound connection and writes it to the writer.
-    pub fn recv_file(
+    #[tracing::instrument(skip_all)]
+    pub async fn recv_file(
         &self,
         file_addrs: DhtAndSocketAddr,
         writer: &mut dyn Write,
     ) -> io::Result<()> {
-        todo!()
+        let mut framed = self.connect_socket(file_addrs.socket_addr).await?;
+        self.send_socket_packet(&mut framed, SocketPayload::FileRequest(file_addrs.dht_addr))
+            .await?;
+
+        let mut response = self.recv_socket_packet(&mut framed).await?;
+        let mut chunk = match response.payload {
+            SocketPayload::FileNotFound => return Err(io::ErrorKind::NotFound.into()),
+            SocketPayload::FileTransfer(chunk) => chunk,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    UnexpectedPacket(Packet::Socket(response)),
+                ))
+            }
+        };
+
+        loop {
+            if chunk.is_empty() {
+                writer.flush()?;
+                break;
+            }
+            writer.write_all(&chunk)?;
+
+            response = self.recv_socket_packet(&mut framed).await?;
+            chunk = match response.payload {
+                SocketPayload::FileTransfer(chunk) => chunk,
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        UnexpectedPacket(Packet::Socket(response)),
+                    ))
+                }
+            };
+        }
+
+        self.disconnect(framed).await
     }
 
     async fn query_remote_connect(&self, socket_addr: SocketAddr) -> Response<ConnectionId> {
@@ -986,6 +1026,34 @@ impl RemotePeerGuard {
                 self.controller
                     .send_socket_packet(src_framed, SocketPayload::Pong(n))
                     .await
+            }
+            SocketPayload::FileRequest(file_addr) => {
+                if let Some(mut reader) = self
+                    .controller
+                    .shared
+                    .opener
+                    .as_deref()
+                    .and_then(|opener| opener(file_addr))
+                {
+                    // FIXME: Make this more efficient.
+                    const CHUNK_SIZE: usize = 512;
+                    let mut buffer = vec![0; CHUNK_SIZE];
+                    loop {
+                        let count = reader.read(&mut buffer[..])?;
+                        buffer.truncate(count);
+                        self.controller
+                            .send_socket_packet(src_framed, SocketPayload::FileTransfer(buffer))
+                            .await?;
+                        if count == 0 {
+                            break Ok(());
+                        }
+                        buffer = vec![0; CHUNK_SIZE];
+                    }
+                } else {
+                    self.controller
+                        .send_socket_packet(src_framed, SocketPayload::FileNotFound)
+                        .await
+                }
             }
             _ => {
                 tracing::error!(?packet, "unexpected inbound packet");

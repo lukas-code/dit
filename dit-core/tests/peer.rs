@@ -1,3 +1,5 @@
+use std::io::{Cursor, ErrorKind};
+
 use rand::seq::IteratorRandom;
 use rand::Rng;
 use tokio::time::Duration;
@@ -234,6 +236,69 @@ async fn ping_socket() {
         .ping_socket(rt2.controller.config().addrs.socket_addr)
         .await
         .unwrap();
+
+    rt1.controller.shutdown().await.unwrap();
+    rt2.controller.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn file_transfer() {
+    install_tracing_subscriber();
+
+    let content = b"very important data";
+    let content_addr = DhtAddr::hash(content);
+
+    let opener = move |addr| (addr == content_addr).then(|| Cursor::new(content));
+
+    let config = get_config(
+        "1000000000000000000000000000000000000000000000000000000000000000"
+            .parse()
+            .unwrap(),
+    );
+    let rt1 = Runtime::with_opener(config, opener).await.unwrap();
+    tokio::spawn(async move {
+        while let Some(peer) = rt1.listener.accept().await.unwrap() {
+            tokio::spawn(peer.run());
+        }
+    });
+    tokio::spawn(rt1.local_peer.run());
+
+    let config = get_config(
+        "2000000000000000000000000000000000000000000000000000000000000000"
+            .parse()
+            .unwrap(),
+    );
+    let rt2 = Runtime::new(config).await.unwrap();
+    tokio::spawn(async move {
+        while let Some(peer) = rt2.listener.accept().await.unwrap() {
+            tokio::spawn(peer.run());
+        }
+    });
+    tokio::spawn(rt2.local_peer.run());
+
+    // Transfer file from rt1 to rt2.
+    let mut writer = Cursor::new(Vec::new());
+    let file_addrs = DhtAndSocketAddr {
+        dht_addr: content_addr,
+        socket_addr: rt1.controller.config().addrs.socket_addr,
+    };
+    rt2.controller
+        .recv_file(file_addrs, &mut writer)
+        .await
+        .unwrap();
+    assert_eq!(writer.get_ref(), content);
+
+    // Test file not found.
+    let file_addrs = DhtAndSocketAddr {
+        dht_addr: DhtAddr::zero(),
+        socket_addr: rt1.controller.config().addrs.socket_addr,
+    };
+    let err = rt2
+        .controller
+        .recv_file(file_addrs, &mut writer)
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::NotFound);
 
     rt1.controller.shutdown().await.unwrap();
     rt2.controller.shutdown().await.unwrap();
