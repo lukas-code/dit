@@ -11,14 +11,20 @@ use std::fs;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::io;
 use tracing::Instrument;
 use tracing_subscriber::filter::{EnvFilter, LevelFilter};
 
 pub async fn run_daemon(config: GlobalConfig) -> Result<(), io::Error> {
-    let rt = Runtime::new(config.clone().peer).await?;
+    let store = Arc::new(Store::open(config.store)?);
 
-    let mut local_listener = LocalListener::new(&config.daemon, rt.controller).await?;
+    let store_clone = store.clone();
+    let opener = move |hash| store_clone.open_file(hash).ok();
+
+    let rt = Runtime::with_opener(config.peer, opener).await?;
+
+    let mut local_listener = LocalListener::new(&config.daemon, rt.controller, store).await?;
     let remote_listener = rt.listener;
 
     let local_listener_task = tokio::spawn(
@@ -103,10 +109,15 @@ pub enum Command {
         /// Hash of the file.
         hash: DhtAddr,
     },
-    /// Announces all files in the store.
+    /// Announces files in the store to the peer-to-peer network.
     Announce {
         /// Hash of the file to announce. If omitted, all files in the store will be announced.
         hash: Option<DhtAddr>,
+    },
+    /// Downloads a file from the peer-to-peer network to the store.
+    Fetch {
+        /// Hash of the file.
+        hash: DhtAddr,
     },
 }
 
@@ -251,6 +262,21 @@ pub async fn run(args: Args) {
                     }
                     println!("announced {} files", files.len());
                 }
+            }
+        }
+        Command::Fetch { hash } => {
+            let Ok(config) = read_config_or_report_error(&args.config) else {
+                return;
+            };
+
+            // Connect to the daemon (get socket from toml)
+            let Ok(mut connection) = connect_to_daemon_or_report_error(&config.daemon).await else {
+                return;
+            };
+
+            match connection.fetch(hash).await {
+                Ok(()) => println!("received file"),
+                Err(err) => eprintln!("error: {err}"),
             }
         }
     }

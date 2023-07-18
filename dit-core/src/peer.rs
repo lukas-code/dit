@@ -546,7 +546,7 @@ impl Controller {
     pub async fn recv_file(
         &self,
         file_addrs: DhtAndSocketAddr,
-        writer: &mut dyn Write,
+        writer: &mut (dyn Write + Send),
     ) -> io::Result<()> {
         let mut framed = self.connect_socket(file_addrs.socket_addr).await?;
         self.send_socket_packet(&mut framed, SocketPayload::FileRequest(file_addrs.dht_addr))

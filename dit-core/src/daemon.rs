@@ -4,12 +4,15 @@
 //! manage the remote peers that connect to the listener.
 
 use crate::codec::Codec;
-use crate::peer::{Controller, DhtAddr};
+use crate::peer::{Controller, DhtAddr, DhtAndSocketAddr};
+use crate::store::Store;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fmt;
+use std::io::{ErrorKind, Seek};
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::io;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::codec::Framed;
@@ -26,6 +29,7 @@ pub enum Packet {
     Bootstrap(SocketAddr),
     Status(Result<(), String>),
     Announce(DhtAddr),
+    Fetch(DhtAddr),
 }
 
 /// This struct represents the connection from the daemon to a process.
@@ -33,6 +37,7 @@ pub enum Packet {
 pub struct ConnectionToProcess {
     stream: Framed<TcpStream, Codec<Packet>>,
     controller: Controller,
+    store: Arc<Store>,
 }
 
 impl ConnectionToProcess {
@@ -65,6 +70,49 @@ impl ConnectionToProcess {
                     tracing::debug!(?result);
                     let status = result.map_err(|err| err.to_string());
                     self.stream.send(Packet::Status(status)).await?;
+                }
+                Ok(Packet::Fetch(hash)) => {
+                    tracing::info!("Received Fetch with hash: {}", hash);
+                    let socket_addrs = self.controller.fetch(hash).await?;
+
+                    let mut result = Err(io::ErrorKind::NotFound.into());
+                    let mut temp_file = self.store.temp_file()?;
+
+                    for socket_addr in socket_addrs {
+                        let file_addrs = DhtAndSocketAddr {
+                            dht_addr: hash,
+                            socket_addr,
+                        };
+                        match self.controller.recv_file(file_addrs, &mut temp_file).await {
+                            Ok(()) => {
+                                result = Ok(());
+                                break;
+                            }
+                            Err(err) if err.kind() == ErrorKind::NotFound => {
+                                continue;
+                            }
+                            Err(err) => {
+                                result = Err(err);
+                                break;
+                            }
+                        }
+                    }
+
+                    tracing::debug!(?result);
+
+                    if result.is_err() {
+                        let status = result.map_err(|err| err.to_string());
+                        return self.stream.send(Packet::Status(status)).await;
+                    }
+
+                    temp_file.rewind()?;
+                    let received_hash = self.store.add_file_from_reader(&mut temp_file)?;
+                    assert_eq!(
+                        hash, received_hash,
+                        "received file differs from requested file"
+                    );
+
+                    self.stream.send(Packet::Status(Ok(()))).await?;
                 }
                 Ok(packet) => {
                     tracing::warn!(?packet, "Received unexpected packet");
@@ -126,6 +174,12 @@ impl ConnectionToDaemon {
         self.receive_status().await
     }
 
+    /// Send a fetch packet to the daemon.
+    pub async fn fetch(&mut self, hash: DhtAddr) -> tokio::io::Result<()> {
+        self.stream.send(Packet::Fetch(hash)).await?;
+        self.receive_status().await
+    }
+
     async fn receive_status(&mut self) -> io::Result<()> {
         let response = self.receive().await?;
         let status = match response {
@@ -158,14 +212,20 @@ impl Error for UnexpectedPacket {}
 pub struct LocalListener {
     tcp_listener: TcpListener,
     controller: Controller,
+    store: Arc<Store>,
 }
 
 impl LocalListener {
-    pub async fn new(config: &DaemonConfig, controller: Controller) -> io::Result<Self> {
+    pub async fn new(
+        config: &DaemonConfig,
+        controller: Controller,
+        store: Arc<Store>,
+    ) -> io::Result<Self> {
         let tcp_listener = TcpListener::bind(config.socket_addr).await?;
         Ok(Self {
             tcp_listener,
             controller,
+            store,
         })
     }
 
@@ -174,6 +234,7 @@ impl LocalListener {
         let process = ConnectionToProcess {
             stream: Framed::new(socket, Codec::new(1024)),
             controller: self.controller.clone(),
+            store: self.store.clone(),
         };
         Ok(Some(process))
     }

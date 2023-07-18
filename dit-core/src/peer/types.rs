@@ -49,7 +49,7 @@ impl DhtAddr {
     }
 
     /// Creates a `DhtAddr` by hashing a stream of data.
-    pub fn hash_reader(file: impl Read) -> io::Result<Self> {
+    pub fn hash_reader(file: &mut impl Read) -> io::Result<Self> {
         const BUFFER_SIZE: usize = 512;
         let mut reader = BufReader::with_capacity(BUFFER_SIZE, file);
         let mut hasher = Sha256::new();
@@ -335,7 +335,7 @@ mod tests {
         }
 
         assert_eq!(
-            DhtAddr::hash_reader(Reader(0)).unwrap(),
+            DhtAddr::hash_reader(&mut Reader(0)).unwrap(),
             DhtAddr::hash([0, 1, 2, 3, 4, 5, 6, 7]),
         );
     }
