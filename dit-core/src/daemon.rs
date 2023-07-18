@@ -4,7 +4,7 @@
 //! manage the remote peers that connect to the listener.
 
 use crate::codec::Codec;
-use crate::peer::Controller;
+use crate::peer::{Controller, DhtAddr};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
@@ -25,6 +25,7 @@ pub enum Packet {
     Pong(u64),
     Bootstrap(SocketAddr),
     Status(Result<(), String>),
+    Announce(DhtAddr),
 }
 
 /// This struct represents the connection from the daemon to a process.
@@ -54,6 +55,13 @@ impl ConnectionToProcess {
 
                     // Bootstrap the local peer
                     let result = self.controller.bootstrap(address).await;
+                    tracing::debug!(?result);
+                    let status = result.map_err(|err| err.to_string());
+                    self.stream.send(Packet::Status(status)).await?;
+                }
+                Ok(Packet::Announce(hash)) => {
+                    tracing::info!("Received Announce with hash: {}", hash);
+                    let result = self.controller.announce(hash).await;
                     tracing::debug!(?result);
                     let status = result.map_err(|err| err.to_string());
                     self.stream.send(Packet::Status(status)).await?;
@@ -109,6 +117,16 @@ impl ConnectionToDaemon {
 
     pub async fn bootstrap(&mut self, address: SocketAddr) -> io::Result<()> {
         self.stream.send(Packet::Bootstrap(address)).await?;
+        self.receive_status().await
+    }
+
+    /// Send an announce packet to the daemon.
+    pub async fn announce(&mut self, hash: DhtAddr) -> tokio::io::Result<()> {
+        self.stream.send(Packet::Announce(hash)).await?;
+        self.receive_status().await
+    }
+
+    async fn receive_status(&mut self) -> io::Result<()> {
         let response = self.receive().await?;
         let status = match response {
             Packet::Status(status) => status,
