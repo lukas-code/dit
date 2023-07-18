@@ -4,19 +4,27 @@
 
 use clap::{Parser, Subcommand};
 use dit_core::config::GlobalConfig;
-use dit_core::daemon::{ConnectionToDaemon, LocalListener, Packet};
-use dit_core::peer::Runtime;
+use dit_core::daemon::{ConnectionToDaemon, DaemonConfig, LocalListener, Packet};
+use dit_core::peer::{DhtAddr, Runtime};
+use dit_core::store::Store;
 use std::fs;
+use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::io;
 use tracing::Instrument;
 use tracing_subscriber::filter::{EnvFilter, LevelFilter};
 
 pub async fn run_daemon(config: GlobalConfig) -> Result<(), io::Error> {
-    let rt = Runtime::new(config.clone().peer).await?;
+    let store = Arc::new(Store::open(config.store)?);
 
-    let mut local_listener = LocalListener::new(&config.daemon, rt.controller).await?;
+    let store_clone = store.clone();
+    let opener = move |hash| store_clone.open_file(hash).ok();
+
+    let rt = Runtime::with_opener(config.peer, opener).await?;
+
+    let mut local_listener = LocalListener::new(&config.daemon, rt.controller, store).await?;
     let remote_listener = rt.listener;
 
     let local_listener_task = tokio::spawn(
@@ -86,6 +94,31 @@ pub enum Command {
         /// The address of the peer to bootstrap the daemon to.
         address: SocketAddr,
     },
+    /// Adds file to store.
+    Add {
+        /// Path to file to add.
+        path: PathBuf,
+    },
+    /// Writes the content of the file from the store to the standard output.
+    Cat {
+        /// Hash of the file.
+        hash: DhtAddr,
+    },
+    /// Removes a file from the store.
+    Rm {
+        /// Hash of the file.
+        hash: DhtAddr,
+    },
+    /// Announces files in the store to the peer-to-peer network.
+    Announce {
+        /// Hash of the file to announce. If omitted, all files in the store will be announced.
+        hash: Option<DhtAddr>,
+    },
+    /// Downloads a file from the peer-to-peer network to the store.
+    Fetch {
+        /// Hash of the file.
+        hash: DhtAddr,
+    },
 }
 
 #[tracing::instrument(name = "run_cli", skip(args))]
@@ -123,13 +156,14 @@ pub async fn run(args: Args) {
             };
 
             // Connect to the daemon (get socket from toml)
-            let mut connection = ConnectionToDaemon::connect(config.daemon.socket_addr)
-                .await
-                .unwrap();
+            let Ok(mut connection) = connect_to_daemon_or_report_error(&config.daemon).await else {
+                return;
+            };
 
             // Send a message to the daemon
             connection.ping(42).await.unwrap(); // Sending a ping packet with 42 as value
 
+            // FIXME: This should be part of the ping method.
             // If you want to receive a packet (for example a pong) after sending ping
             match connection.receive().await {
                 Ok(Packet::Pong(value)) => {
@@ -166,6 +200,85 @@ pub async fn run(args: Args) {
                 }
             }
         }
+        Command::Add { path } => {
+            let Ok(config) = read_config_or_report_error(&args.config) else {
+                return;
+            };
+
+            let store = Store::open(config.store).unwrap();
+            let hash = store.add_file(path).unwrap();
+            println!("Added file: {hash}");
+        }
+        Command::Cat { hash } => {
+            let Ok(config) = read_config_or_report_error(&args.config) else {
+                return;
+            };
+
+            let store = Store::open(config.store).unwrap();
+            let mut file = match store.open_file(hash) {
+                Ok(file) => file,
+                Err(err) => {
+                    eprintln!("error: failed to open file for hash {hash}: {err}");
+                    return;
+                }
+            };
+            std::io::copy(&mut file, &mut std::io::stdout()).unwrap();
+        }
+        Command::Rm { hash } => {
+            let Ok(config) = read_config_or_report_error(&args.config) else {
+                return;
+            };
+
+            let store = Store::open(config.store).unwrap();
+            match store.remove_file(hash) {
+                Ok(file) => file,
+                Err(err) => {
+                    eprintln!("error: failed to remove file for hash {hash}: {err}");
+                }
+            };
+        }
+        Command::Announce { hash } => {
+            let Ok(config) = read_config_or_report_error(&args.config) else {
+                return;
+            };
+
+            // Connect to the daemon (get socket from toml)
+            let Ok(mut connection) = connect_to_daemon_or_report_error(&config.daemon).await else {
+                return;
+            };
+
+            let store = Store::open(config.store).unwrap();
+
+            if let Some(hash) = hash {
+                connection.announce(hash).await.unwrap();
+            } else {
+                let files = store.files().unwrap();
+                if files.is_empty() {
+                    println!("No files to announce");
+                    println!("help: try adding some files with `dit add`");
+                } else {
+                    for &file in &files {
+                        connection.announce(file).await.unwrap();
+                    }
+                    println!("announced {} files", files.len());
+                }
+            }
+        }
+        Command::Fetch { hash } => {
+            let Ok(config) = read_config_or_report_error(&args.config) else {
+                return;
+            };
+
+            // Connect to the daemon (get socket from toml)
+            let Ok(mut connection) = connect_to_daemon_or_report_error(&config.daemon).await else {
+                return;
+            };
+
+            match connection.fetch(hash).await {
+                Ok(()) => println!("received file"),
+                Err(err) => eprintln!("error: {err}"),
+            }
+        }
     }
 }
 
@@ -185,6 +298,20 @@ fn read_config_or_report_error(path: &Path) -> Result<GlobalConfig, ErrorReporte
         eprintln!("error: {err}");
         ErrorReported
     })
+}
+
+async fn connect_to_daemon_or_report_error(
+    config: &DaemonConfig,
+) -> Result<ConnectionToDaemon, ErrorReported> {
+    ConnectionToDaemon::connect(config.socket_addr)
+        .await
+        .map_err(|err| {
+            eprintln!("error: failed to connect to daemon: {err}");
+            if err.kind() == ErrorKind::ConnectionRefused {
+                eprintln!("help: try starting the daemon with `dit daemon`");
+            }
+            ErrorReported
+        })
 }
 
 fn validate_config_for_running_peer(config: &GlobalConfig) -> Result<(), ErrorReported> {

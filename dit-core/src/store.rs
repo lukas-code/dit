@@ -1,6 +1,6 @@
 use crate::peer::DhtAddr;
 use std::fs::{self, File};
-use std::io::{self, Seek};
+use std::io::{self, Read, Seek};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,18 +18,24 @@ impl Store {
     /// Opens the dit store, creating the directory structure if needed.
     pub fn open(config: StoreConfig) -> io::Result<Self> {
         fs::create_dir_all(config.dir.join("blobs"))?;
+        fs::create_dir_all(config.dir.join("temp"))?;
         Ok(Self { config })
     }
 
     /// Copies a file into the store without notifying peers.
     pub fn add_file(&self, src_path: impl AsRef<Path>) -> io::Result<DhtAddr> {
         let mut src_file = File::open(&src_path)?;
-        let hash = DhtAddr::hash_reader(&mut src_file)?;
+        self.add_file_from_reader(&mut src_file)
+    }
+
+    /// Copies data from a reader into the store without notifying peers.
+    pub fn add_file_from_reader(&self, reader: &mut (impl Read + Seek)) -> io::Result<DhtAddr> {
+        let hash = DhtAddr::hash_reader(reader)?;
 
         let dst_path = self.blob_path(hash);
         let mut dst_file = File::create(dst_path)?;
-        src_file.rewind()?;
-        io::copy(&mut src_file, &mut dst_file)?;
+        reader.rewind()?;
+        io::copy(reader, &mut dst_file)?;
 
         Ok(hash)
     }
@@ -44,10 +50,34 @@ impl Store {
         fs::remove_file(self.blob_path(file_hash))
     }
 
+    /// Creates a temporary file in the store.
+    pub fn temp_file(&self) -> io::Result<File> {
+        tempfile::tempfile_in(self.config.dir.join("temp"))
+    }
+
     fn blob_path(&self, hash: DhtAddr) -> PathBuf {
         let mut dst_path = self.config.dir.join("blobs");
         dst_path.push(hash.to_string());
         dst_path
+    }
+
+    /// Returns a list of all files (hashes) in the store.
+    pub fn files(&self) -> io::Result<Vec<DhtAddr>> {
+        let mut hashes = vec![];
+
+        for entry in fs::read_dir(self.config.dir.join("blobs"))? {
+            let entry = entry?;
+            if entry.file_type()?.is_file() {
+                let filename = entry.file_name();
+                let filename = filename.to_string_lossy();
+                let hash = filename
+                    .parse()
+                    .expect("expected file name of blob to be a hash");
+                hashes.push(hash);
+            }
+        }
+
+        Ok(hashes)
     }
 }
 
