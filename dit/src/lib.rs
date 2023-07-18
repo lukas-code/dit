@@ -88,10 +88,20 @@ pub enum Command {
         /// The address of the peer to bootstrap the daemon to.
         address: SocketAddr,
     },
-    /// Adds file to store
+    /// Adds file to store.
     Add {
-        /// Path to file to add
-        filepath: PathBuf,
+        /// Path to file to add.
+        path: PathBuf,
+    },
+    /// Writes the content of the file from the store to the standard output.
+    Cat {
+        /// Hash of the file.
+        hash: DhtAddr,
+    },
+    /// Removes a file from the store.
+    Rm {
+        /// Hash of the file.
+        hash: DhtAddr,
     },
     /// Announces all files in the store.
     Announce {
@@ -179,14 +189,42 @@ pub async fn run(args: Args) {
                 }
             }
         }
-        Command::Add { filepath } => {
+        Command::Add { path } => {
             let Ok(config) = read_config_or_report_error(&args.config) else {
                 return;
             };
 
             let store = Store::open(config.store).unwrap();
-            let hash = store.add_file(filepath).unwrap();
+            let hash = store.add_file(path).unwrap();
             println!("Added file: {hash}");
+        }
+        Command::Cat { hash } => {
+            let Ok(config) = read_config_or_report_error(&args.config) else {
+                return;
+            };
+
+            let store = Store::open(config.store).unwrap();
+            let mut file = match store.open_file(hash) {
+                Ok(file) => file,
+                Err(err) => {
+                    eprintln!("error: failed to open file for hash {hash}: {err}");
+                    return;
+                }
+            };
+            std::io::copy(&mut file, &mut std::io::stdout()).unwrap();
+        }
+        Command::Rm { hash } => {
+            let Ok(config) = read_config_or_report_error(&args.config) else {
+                return;
+            };
+
+            let store = Store::open(config.store).unwrap();
+            match store.remove_file(hash) {
+                Ok(file) => file,
+                Err(err) => {
+                    eprintln!("error: failed to remove file for hash {hash}: {err}");
+                }
+            };
         }
         Command::Announce { hash } => {
             let Ok(config) = read_config_or_report_error(&args.config) else {
